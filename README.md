@@ -47,7 +47,3 @@ Con la variable de entorno `UGL_DATA_DIR` se puede usar otra carpeta.
 
 Nada de este código se ha compilado ni ejecutado todavía. Hay pruebas unitarias escritas (VDF, Steam, escaneo de carpetas, base de datos, importación) pero **no se han corrido**.
 El flujo `.github/workflows/ci.yml` ejecuta pruebas, clippy y compilación release en Windows.
-
-## Pendiente (no forma parte de 0.1)
-
-Estanterías esqueumórficas, logros, ZIP portable, GitHub Releases automáticos, icono y manifiesto de Windows, y elección de licencia (el proyecto aún no tiene una).
