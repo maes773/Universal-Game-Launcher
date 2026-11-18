@@ -9,11 +9,15 @@ pub mod database;
 pub mod diagnostics;
 pub mod domain;
 pub mod error;
+pub mod icons;
 pub mod integrations;
+pub mod net;
 pub mod paths;
+pub mod png;
 pub mod process_manager;
 pub mod registry;
 pub mod settings;
+pub mod watcher;
 
 pub use application::Core;
 pub use domain::{

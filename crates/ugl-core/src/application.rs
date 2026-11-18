@@ -12,7 +12,11 @@ use crate::domain::{
 use crate::error::{Result, UglError};
 use crate::integrations::manual::{self, PROVIDER_MANUAL};
 use crate::integrations::steam::SteamScan;
-use crate::integrations::steam_achievements::{SteamAchievementSet, SOURCE_STEAM_LOCAL};
+use crate::icons::IconJob;
+use crate::integrations::steam::PROVIDER_STEAM;
+use crate::integrations::steam_achievements::{
+    self, SteamAchievementSet, SOURCE_STEAM_LOCAL,
+};
 use crate::{process_manager, registry, settings};
 
 /// Lo necesario para leer los logros de un juego de Steam fuera del hilo de la interfaz.
@@ -113,7 +117,7 @@ impl Core {
     }
 
     pub fn import_steam(&mut self, scan: &SteamScan) -> Result<RegisterSummary> {
-        self.remember_steam_root(&scan.steam_root);
+        self.remember_steam_root(&scan.steam_root, &scan.libraries);
         let summary = registry::register(self.db.conn_mut(), &scan.to_discovered())?;
         diagnostics::info(&format!(
             "Importación de Steam: {} nuevo(s), {} ya existente(s), {} actualizado(s)",
@@ -144,17 +148,156 @@ impl Core {
 
     /// Guarda la carpeta principal de Steam, necesaria para leer su caché de logros.
     /// Se ignora si la carpeta elegida es solo una biblioteca adicional (no tiene `appcache`).
-    fn remember_steam_root(&mut self, root: &Path) {
+    fn remember_steam_root(&mut self, root: &Path, libraries: &[PathBuf]) {
         if !root.join("appcache").is_dir() {
             return;
         }
-        if let Err(err) = settings::set(
-            self.db.conn(),
-            settings::KEY_STEAM_ROOT,
-            &root.to_string_lossy(),
-        ) {
+        let joined = libraries
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let saved = settings::set(self.db.conn(), settings::KEY_STEAM_ROOT, &root.to_string_lossy())
+            .and_then(|_| settings::set(self.db.conn(), settings::KEY_STEAM_LIBRARIES, &joined));
+        if let Err(err) = saved {
             diagnostics::warn(&format!("No se pudo guardar la carpeta de Steam: {err}"));
         }
+    }
+
+    /// Carpeta principal de Steam recordada (la que contiene `appcache`).
+    pub fn steam_root(&self) -> Option<PathBuf> {
+        settings::get(self.db.conn(), settings::KEY_STEAM_ROOT)
+            .ok()
+            .flatten()
+            .map(PathBuf::from)
+            .filter(|path| path.join("appcache").is_dir())
+    }
+
+    fn steam_libraries(&self) -> Vec<PathBuf> {
+        settings::get(self.db.conn(), settings::KEY_STEAM_LIBRARIES)
+            .ok()
+            .flatten()
+            .map(|text| {
+                text.lines()
+                    .filter(|line| !line.is_empty())
+                    .map(PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Carpetas que conviene vigilar: la caché de logros y la carpeta `steamapps` de cada biblioteca.
+    pub fn steam_watch_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = Vec::new();
+        if let Some(root) = self.steam_root() {
+            dirs.push(root.join("appcache").join("stats"));
+        }
+        for library in self.steam_libraries() {
+            dirs.push(library.join("steamapps"));
+        }
+        dirs.retain(|dir| dir.is_dir());
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
+    pub fn find_steam_game(&self, app_id: u64) -> Option<GameId> {
+        registry::find_game_by_source(self.db.conn(), PROVIDER_STEAM, &app_id.to_string())
+            .ok()
+            .flatten()
+    }
+
+    /// Juegos de Steam con logros cuyo progreso cambió en Steam desde la última sincronización
+    /// (por ejemplo, logros ganados mientras UGL estaba cerrado).
+    pub fn stale_achievement_jobs(&self) -> Vec<(GameId, SteamAchievementJob)> {
+        let Some(root) = self.steam_root() else {
+            return Vec::new();
+        };
+        let games =
+            registry::list_games(self.db.conn(), "", SortOrder::Title).unwrap_or_default();
+        games
+            .into_iter()
+            .filter(|g| g.launch_kind == LaunchKind::SteamUri && g.achievements_total > 0)
+            .filter_map(|game| {
+                let app_id: u64 = game.launch_target.trim().parse().ok()?;
+                let modified = steam_achievements::user_stats_modified(&root, app_id)?;
+                let synced = achievement_engine::synced_at(self.db.conn(), game.id)
+                    .ok()
+                    .flatten()
+                    .unwrap_or(0);
+                (modified > synced).then(|| {
+                    (
+                        game.id,
+                        SteamAchievementJob {
+                            steam_root: root.clone(),
+                            app_id,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    // ---- Iconos de juegos ----
+
+    /// Juegos a los que todavía no se les ha buscado el icono.
+    pub fn icon_jobs(&self, limit: usize) -> Vec<IconJob> {
+        registry::games_without_icon(self.db.conn(), limit)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|game| IconJob {
+                game_id: game.id,
+                install_path: game.install_path,
+                launch_kind: game.launch_kind,
+                launch_target: game.launch_target,
+            })
+            .collect()
+    }
+
+    /// Anota el resultado: `Some(ruta)` si hay icono, `None` si se intentó y no lo hay.
+    pub fn record_icon_result(&mut self, id: GameId, icon: Option<&Path>) {
+        let value = icon
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if let Err(err) = registry::set_icon_path(self.db.conn(), id, &value) {
+            diagnostics::warn(&format!("No se pudo guardar el icono del juego {id}: {err}"));
+        }
+    }
+
+    // ---- Preferencias de automatización ----
+
+    fn flag(&self, key: &str, default: bool) -> bool {
+        settings::get(self.db.conn(), key)
+            .ok()
+            .flatten()
+            .map(|value| value == "1")
+            .unwrap_or(default)
+    }
+
+    /// Vigilar Steam y actualizar juegos y logros automáticamente (activado por defecto).
+    pub fn auto_update_enabled(&self) -> bool {
+        self.flag(settings::KEY_AUTO_UPDATE, true)
+    }
+
+    pub fn set_auto_update_enabled(&mut self, enabled: bool) -> Result<()> {
+        settings::set(
+            self.db.conn(),
+            settings::KEY_AUTO_UPDATE,
+            if enabled { "1" } else { "0" },
+        )
+    }
+
+    /// Descargar de los servidores de Steam las imágenes de logros que no estén en disco.
+    pub fn download_icons_enabled(&self) -> bool {
+        self.flag(settings::KEY_DOWNLOAD_ICONS, true)
+    }
+
+    pub fn set_download_icons_enabled(&mut self, enabled: bool) -> Result<()> {
+        settings::set(
+            self.db.conn(),
+            settings::KEY_DOWNLOAD_ICONS,
+            if enabled { "1" } else { "0" },
+        )
     }
 
     // ---- Logros ----
@@ -255,7 +398,10 @@ impl Core {
                 "El ejecutable debe estar dentro de la carpeta de instalación del juego.".into(),
             )
         })?;
-        registry::set_executable(self.db.conn(), id, &relative.to_string_lossy())
+        registry::set_executable(self.db.conn(), id, &relative.to_string_lossy())?;
+        // El icono sale del ejecutable: se vuelve a extraer.
+        registry::clear_icon(self.db.conn(), id)?;
+        Ok(())
     }
 
     /// Actualiza la carpeta de instalación (por ejemplo, si el usuario movió el juego). El ejecutable
@@ -390,6 +536,9 @@ mod tests {
         core.import_steam(&scan).unwrap();
         let id = core.list_games("").unwrap()[0].id;
 
+        assert_eq!(core.find_steam_game(220), Some(id));
+        assert_eq!(core.find_steam_game(999), None);
+
         let job = core.steam_achievement_job(id).unwrap();
         assert_eq!(job.app_id, 220);
         let set = read_local_achievements(&job.steam_root, job.app_id).unwrap();
@@ -412,6 +561,56 @@ mod tests {
             .unwrap();
         let id = core.list_games("").unwrap()[0].id;
         assert!(core.steam_achievement_job(id).is_err());
+    }
+
+    #[test]
+    fn new_games_wait_for_an_icon_until_a_result_is_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = make_game_dir(tmp.path(), "Juego");
+        let mut core = Core::open_in_memory().unwrap();
+        core.import_folder_game(&dir, "Juego", Path::new("bin/juego.exe"))
+            .unwrap();
+
+        let jobs = core.icon_jobs(10);
+        assert_eq!(jobs.len(), 1);
+        core.record_icon_result(jobs[0].game_id, None);
+        assert!(core.icon_jobs(10).is_empty());
+
+        // Cambiar el ejecutable obliga a extraer el icono otra vez.
+        core.set_game_executable(jobs[0].game_id, &dir.join("bin").join("otro.exe"))
+            .unwrap();
+        assert_eq!(core.icon_jobs(10).len(), 1);
+    }
+
+    #[test]
+    fn automation_defaults_to_on_and_can_be_switched_off() {
+        let mut core = Core::open_in_memory().unwrap();
+        assert!(core.auto_update_enabled());
+        assert!(core.download_icons_enabled());
+        core.set_auto_update_enabled(false).unwrap();
+        core.set_download_icons_enabled(false).unwrap();
+        assert!(!core.auto_update_enabled());
+        assert!(!core.download_icons_enabled());
+    }
+
+    #[test]
+    fn steam_import_remembers_which_folders_to_watch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("Steam");
+        let apps = root.join("steamapps");
+        fs::create_dir_all(apps.join("common")).unwrap();
+        fs::create_dir_all(root.join("appcache").join("stats")).unwrap();
+
+        let mut core = Core::open_in_memory().unwrap();
+        assert!(core.steam_watch_dirs().is_empty());
+
+        let scan = crate::integrations::steam::scan_steam_folder(&root).unwrap();
+        core.import_steam(&scan).unwrap();
+
+        let dirs = core.steam_watch_dirs();
+        assert!(dirs.contains(&apps));
+        assert!(dirs.contains(&root.join("appcache").join("stats")));
+        assert_eq!(core.steam_root(), Some(root));
     }
 
     #[test]

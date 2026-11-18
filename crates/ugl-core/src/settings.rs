@@ -7,6 +7,9 @@ use crate::error::Result;
 pub const KEY_SORT_ORDER: &str = "library.sort_order";
 pub const KEY_LAST_IMPORT_DIR: &str = "import.last_dir";
 pub const KEY_STEAM_ROOT: &str = "steam.root";
+pub const KEY_STEAM_LIBRARIES: &str = "steam.libraries";
+pub const KEY_AUTO_UPDATE: &str = "auto.update";
+pub const KEY_DOWNLOAD_ICONS: &str = "net.download_icons";
 
 pub fn get(conn: &Connection, key: &str) -> Result<Option<String>> {
     let value = conn

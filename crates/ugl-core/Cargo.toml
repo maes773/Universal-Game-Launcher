@@ -8,6 +8,8 @@ description = "Núcleo de UGL: dominio, base de datos e integraciones (sin inter
 rusqlite.workspace = true
 thiserror.workspace = true
 dirs.workspace = true
+# Vigilancia de carpetas por eventos del sistema (sin sondeo: consumo nulo en reposo).
+notify = "6"
 
 [dev-dependencies]
 tempfile = "3"

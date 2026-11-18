@@ -19,7 +19,8 @@ SELECT g.id,
        g.last_played_at,
        (SELECT COUNT(*) FROM achievements WHERE game_id = g.id),
        (SELECT COUNT(*) FROM achievements a JOIN unlocks u ON u.achievement_id = a.id
-         WHERE a.game_id = g.id AND u.unlocked = 1)
+         WHERE a.game_id = g.id AND u.unlocked = 1),
+       g.icon_path
 FROM games g
 JOIN platforms p ON p.id = g.platform_id
 JOIN installations i ON i.id = (
@@ -49,6 +50,7 @@ fn map_game(row: &Row<'_>) -> rusqlite::Result<Game> {
         last_played_at: row.get(8)?,
         achievements_total: row.get::<_, i64>(9)? as u32,
         achievements_unlocked: row.get::<_, i64>(10)? as u32,
+        icon_path: row.get(11)?,
     })
 }
 
@@ -207,6 +209,46 @@ pub fn remove_game(conn: &Connection, id: GameId) -> Result<()> {
     Ok(())
 }
 
+/// Guarda la ruta del icono en caché. Una cadena vacía significa «se intentó y no hay icono».
+pub fn set_icon_path(conn: &Connection, id: GameId, path: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE games SET icon_path = ?1 WHERE id = ?2",
+        params![path, id],
+    )?;
+    Ok(())
+}
+
+/// Olvida el icono para que se vuelva a extraer (por ejemplo, tras cambiar el ejecutable).
+pub fn clear_icon(conn: &Connection, id: GameId) -> Result<()> {
+    conn.execute("UPDATE games SET icon_path = NULL WHERE id = ?1", params![id])?;
+    Ok(())
+}
+
+pub fn games_without_icon(conn: &Connection, limit: usize) -> Result<Vec<Game>> {
+    let sql = format!(
+        "{GAME_SELECT} WHERE g.hidden = 0 AND g.icon_path IS NULL ORDER BY g.id LIMIT ?1"
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params![limit as i64], map_game)?;
+    let games = rows.collect::<rusqlite::Result<Vec<Game>>>()?;
+    Ok(games)
+}
+
+pub fn find_game_by_source(
+    conn: &Connection,
+    provider: &str,
+    external_id: &str,
+) -> Result<Option<GameId>> {
+    let found = conn
+        .query_row(
+            "SELECT game_id FROM game_sources WHERE provider = ?1 AND external_id = ?2",
+            params![provider, external_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -295,6 +337,29 @@ mod tests {
             .unwrap();
         assert_eq!(installs, 0);
         assert_eq!(sources, 0);
+    }
+
+    #[test]
+    fn icon_state_goes_from_unknown_to_known() {
+        let mut db = Database::open_in_memory().unwrap();
+        register(db.conn_mut(), &[steam_game(1, "Alfa", "C:\\a")]).unwrap();
+        let id = list_games(db.conn(), "", SortOrder::Title).unwrap()[0].id;
+
+        assert_eq!(games_without_icon(db.conn(), 10).unwrap().len(), 1);
+        set_icon_path(db.conn(), id, "").unwrap(); // se intentó y no hay icono
+        assert!(games_without_icon(db.conn(), 10).unwrap().is_empty());
+        assert_eq!(get_game(db.conn(), id).unwrap().icon_path.as_deref(), Some(""));
+
+        clear_icon(db.conn(), id).unwrap();
+        assert_eq!(games_without_icon(db.conn(), 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn finds_a_game_by_its_source() {
+        let mut db = Database::open_in_memory().unwrap();
+        register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
+        assert!(find_game_by_source(db.conn(), "steam", "220").unwrap().is_some());
+        assert!(find_game_by_source(db.conn(), "steam", "999").unwrap().is_none());
     }
 
     #[test]

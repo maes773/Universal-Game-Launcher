@@ -1,7 +1,7 @@
 // UGL 0.1 — Foundation. Interfaz funcional y sencilla.
 // El diseño esqueumórfico (estanterías, cajas, cartuchos) llega en una etapa posterior.
 
-import { Button, LineEdit, ComboBox, ListView } from "std-widgets.slint";
+import { Button, CheckBox, LineEdit, ComboBox, ListView } from "std-widgets.slint";
 
 export struct GameItem {
     id: int,
@@ -9,6 +9,9 @@ export struct GameItem {
     source: string,
     ach-total: int,
     ach-unlocked: int,
+    icon: image,
+    has-icon: bool,
+    initial: string,
 }
 
 export struct ExeItem {
@@ -29,6 +32,9 @@ export struct GameDetail {
     ach-total: int,
     ach-unlocked: int,
     can-show-achievements: bool,
+    icon: image,
+    has-icon: bool,
+    initial: string,
 }
 
 export struct AchievementItem {
@@ -62,6 +68,40 @@ component NavButton inherits Rectangle {
         text: root.label;
         color: root.selected ? #f2e6d4 : #b9a58e;
         font-size: 15px;
+        vertical-alignment: center;
+    }
+}
+
+component GameIcon inherits Rectangle {
+    in property <image> icon;
+    in property <bool> has-icon;
+    in property <string> initial;
+    in property <length> side: 40px;
+
+    width: root.side;
+    height: root.side;
+    border-radius: 6px;
+    border-width: 1px;
+    border-color: #4a3626;
+    background: #140e0a;
+    clip: true;
+
+    if root.has-icon : Image {
+        x: 0px;
+        y: 0px;
+        width: parent.width;
+        height: parent.height;
+        source: root.icon;
+        image-fit: contain;
+    }
+    if !root.has-icon : Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.initial;
+        color: #c98a3b;
+        font-size: root.side * 0.5;
+        font-weight: 800;
+        horizontal-alignment: center;
         vertical-alignment: center;
     }
 }
@@ -133,6 +173,7 @@ component ImportCard inherits Rectangle {
 
 export component MainWindow inherits Window {
     title: "UGL — Universal Game Launcher";
+    icon: @image-url("../assets/ugl.png");
     preferred-width: 1100px;
     preferred-height: 720px;
     min-width: 900px;
@@ -149,6 +190,8 @@ export component MainWindow inherits Window {
     in property <string> log-path;
     in-out property <int> current-view: 0;
     in-out property <int> sort-index: 0;
+    in-out property <bool> auto-update: true;
+    in-out property <bool> download-icons: true;
 
     // Diálogo de importación de un juego individual
     in property <bool> import-dialog-visible: false;
@@ -177,6 +220,8 @@ export component MainWindow inherits Window {
     callback change-path-clicked(int);
     callback remove-clicked(int);
     callback achievements-clicked(int);
+    callback auto-update-toggled(bool);
+    callback download-icons-toggled(bool);
 
     HorizontalLayout {
         // Barra lateral
@@ -275,7 +320,13 @@ export component MainWindow inherits Window {
                             padding-bottom: 8px;
                             spacing: 12px;
 
+                            GameIcon {
+                                icon: game.icon;
+                                has-icon: game.has-icon;
+                                initial: game.initial;
+                            }
                             VerticalLayout {
+                                horizontal-stretch: 1;
                                 alignment: center;
                                 Text {
                                     text: game.title;
@@ -381,6 +432,29 @@ export component MainWindow inherits Window {
                 }
                 Text {
                     text: "El orden de la biblioteca y la última carpeta de importación se guardan automáticamente.";
+                    color: #8a7662;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Rectangle { height: 8px; }
+                CheckBox {
+                    text: "Actualizar automáticamente juegos de Steam y logros";
+                    checked <=> root.auto-update;
+                    toggled => { root.auto-update-toggled(self.checked); }
+                }
+                Text {
+                    text: "Vigila tu carpeta de Steam con eventos del sistema (sin sondeo): detecta juegos nuevos al terminar de instalarse y actualiza los logros en cuanto Steam los guarda.";
+                    color: #8a7662;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                CheckBox {
+                    text: "Descargar de Steam las imágenes de logros que falten";
+                    checked <=> root.download-icons;
+                    toggled => { root.download-icons-toggled(self.checked); }
+                }
+                Text {
+                    text: "Es la única función de UGL que usa internet: pide a los servidores de imágenes de Steam solo el icono de cada logro (por AppID y código de imagen) y lo guarda en tu equipo. Desactívala y UGL funcionará sin conexión con las imágenes que ya existan.";
                     color: #8a7662;
                     font-size: 12px;
                     wrap: word-wrap;
@@ -532,12 +606,24 @@ export component MainWindow inherits Window {
                 padding: 22px;
                 spacing: 8px;
 
-                Text {
-                    text: root.detail.title;
-                    color: #f2e6d4;
-                    font-size: 22px;
-                    font-weight: 700;
-                    wrap: word-wrap;
+                HorizontalLayout {
+                    spacing: 14px;
+
+                    GameIcon {
+                        side: 56px;
+                        icon: root.detail.icon;
+                        has-icon: root.detail.has-icon;
+                        initial: root.detail.initial;
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.detail.title;
+                        color: #f2e6d4;
+                        font-size: 22px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                    }
                 }
                 Text {
                     text: "Origen: " + root.detail.source;
@@ -769,6 +855,7 @@ component AchievementRow inherits Rectangle {
 
 export component AchievementsWindow inherits Window {
     title: "UGL — Logros";
+    icon: @image-url("../assets/ugl.png");
     preferred-width: 780px;
     preferred-height: 660px;
     min-width: 640px;

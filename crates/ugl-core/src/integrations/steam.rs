@@ -84,6 +84,8 @@ struct Manifest {
     app_id: u64,
     name: String,
     install_dir: String,
+    /// `StateFlags` de Steam: el bit 4 indica «instalado por completo».
+    state_flags: Option<u32>,
 }
 
 fn app_id_from_file_name(file_name: &str) -> Option<u64> {
@@ -135,10 +137,16 @@ fn parse_manifest(text: &str, file_name: &str) -> std::result::Result<Manifest, 
         .unwrap_or(install_dir.as_str())
         .to_string();
 
+    let state_flags = state
+        .get("StateFlags")
+        .and_then(Vdf::as_str)
+        .and_then(|v| v.trim().parse::<u32>().ok());
+
     Ok(Manifest {
         app_id,
         name,
         install_dir,
+        state_flags,
     })
 }
 
@@ -263,6 +271,14 @@ pub fn scan_steam_folder(selected: &Path) -> Result<SteamScan> {
                 continue;
             }
 
+            // Instalación a medias (descarga en curso): se espera a que termine.
+            if let Some(flags) = manifest.state_flags {
+                if flags & 4 == 0 {
+                    skipped_not_installed += 1;
+                    continue;
+                }
+            }
+
             let install_path = steamapps.join("common").join(&manifest.install_dir);
             if !install_path.is_dir() {
                 skipped_not_installed += 1;
@@ -359,6 +375,24 @@ mod tests {
 
         let discovered = scan.to_discovered();
         assert_eq!(discovered[0].launch_target, "220");
+    }
+
+    #[test]
+    fn games_still_downloading_are_not_imported_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let apps = tmp.path().join("steamapps");
+        fs::create_dir_all(apps.join("common").join("Half-Life 2")).unwrap();
+        let downloading = ACF_HL2.replace("\"StateFlags\"\t\t\"4\"", "\"StateFlags\"\t\t\"1026\"");
+        assert_ne!(downloading, ACF_HL2);
+        fs::write(apps.join("appmanifest_220.acf"), downloading).unwrap();
+
+        let scan = scan_steam_folder(tmp.path()).unwrap();
+        assert!(scan.games.is_empty());
+        assert_eq!(scan.skipped_not_installed, 1);
+
+        // Al terminar la instalación (StateFlags 4) aparece.
+        fs::write(apps.join("appmanifest_220.acf"), ACF_HL2).unwrap();
+        assert_eq!(scan_steam_folder(tmp.path()).unwrap().games.len(), 1);
     }
 
     #[test]

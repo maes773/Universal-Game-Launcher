@@ -15,6 +15,7 @@ use std::time::SystemTime;
 
 use super::binary_kv::{self, Bkv};
 use crate::error::{Result, UglError};
+use crate::{diagnostics, net};
 
 pub const SOURCE_STEAM_LOCAL: &str = "steam_local";
 
@@ -48,8 +49,12 @@ pub struct SteamAchievement {
     pub name: String,
     pub description: String,
     pub hidden: bool,
+    /// Icono a color y en gris, si ya están en disco.
     pub icon: Option<PathBuf>,
     pub icon_gray: Option<PathBuf>,
+    /// Identificadores de las imágenes (para localizarlas o descargarlas si faltan).
+    pub icon_hash: Option<String>,
+    pub icon_gray_hash: Option<String>,
     pub unlocked: bool,
     pub unlocked_at: Option<i64>,
 }
@@ -226,6 +231,117 @@ fn resolve_icon(icon_dir: &Path, name: &str) -> Option<PathBuf> {
         .find(|path| path.is_file())
 }
 
+/// «abc123.jpg» → «abc123». Solo caracteres seguros: el nombre acaba formando parte de una URL
+/// y de una ruta de archivo.
+pub fn normalize_icon_hash(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    let stem = trimmed
+        .strip_suffix(".jpg")
+        .or_else(|| trimmed.strip_suffix(".png"))
+        .unwrap_or(trimmed);
+    let valid = !stem.is_empty()
+        && stem.len() <= 128
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    valid.then(|| stem.to_string())
+}
+
+/// Carpeta de UGL donde se guardan las imágenes de logros de un juego.
+pub fn achievement_icon_dir(cache_dir: &Path, app_id: u64) -> PathBuf {
+    cache_dir.join("achievements").join(app_id.to_string())
+}
+
+/// Marca de tiempo (Unix) del archivo de progreso más reciente de ese juego, si existe.
+pub fn user_stats_modified(steam_root: &Path, app_id: u64) -> Option<i64> {
+    let stats_dir = steam_root.join("appcache").join("stats");
+    let path = newest_user_stats(&stats_dir, app_id)?;
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    modified
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IconReport {
+    pub from_cache: usize,
+    pub downloaded: usize,
+    pub failed: usize,
+    pub still_missing: usize,
+}
+
+/// Servidores de imágenes de la comunidad de Steam, en orden de preferencia.
+const ICON_HOSTS: &[&str] = &[
+    "https://cdn.cloudflare.steamstatic.com",
+    "https://cdn.akamai.steamstatic.com",
+    "https://media.steampowered.com",
+];
+
+fn download_achievement_icon(app_id: u64, hash: &str, dest: &Path) -> Result<()> {
+    let mut last_error = None;
+    for host in ICON_HOSTS {
+        let url = format!("{host}/steamcommunity/public/images/apps/{app_id}/{hash}.jpg");
+        match net::download_image(&url, dest) {
+            Ok(()) => return Ok(()),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| UglError::Invalid("no hay servidores de imágenes".into())))
+}
+
+/// Completa los iconos que faltan: primero la caché de UGL y, si `allow_download`, la descarga.
+/// Tras tres fallos seguidos deja de intentarlo (sin conexión) y lo reintentará en otra ocasión.
+pub fn resolve_missing_icons(
+    set: &mut SteamAchievementSet,
+    cache_dir: &Path,
+    allow_download: bool,
+) -> IconReport {
+    let dir = achievement_icon_dir(cache_dir, set.app_id);
+    let app_id = set.app_id;
+    let mut report = IconReport::default();
+    let mut fail_streak = 0u32;
+
+    for achievement in set.achievements.iter_mut() {
+        let slots = [
+            (achievement.icon_hash.clone(), &mut achievement.icon),
+            (achievement.icon_gray_hash.clone(), &mut achievement.icon_gray),
+        ];
+        for (hash, slot) in slots {
+            if slot.is_some() {
+                continue;
+            }
+            let Some(hash) = hash else {
+                continue;
+            };
+            let target = dir.join(format!("{hash}.jpg"));
+            if target.is_file() {
+                *slot = Some(target);
+                report.from_cache += 1;
+                continue;
+            }
+            if !allow_download || fail_streak >= 3 {
+                report.still_missing += 1;
+                continue;
+            }
+            match download_achievement_icon(app_id, &hash, &target) {
+                Ok(()) => {
+                    *slot = Some(target);
+                    report.downloaded += 1;
+                    fail_streak = 0;
+                }
+                Err(err) => {
+                    diagnostics::warn(&format!("Imagen de logro {hash} (juego {app_id}): {err}"));
+                    report.failed += 1;
+                    report.still_missing += 1;
+                    fail_streak += 1;
+                }
+            }
+        }
+    }
+    report
+}
+
 /// Lee los logros de un juego desde la caché local de Steam. Pensado para un hilo aparte.
 pub fn read_local_achievements(steam_root: &Path, app_id: u64) -> Result<SteamAchievementSet> {
     let stats_dir = steam_root.join("appcache").join("stats");
@@ -288,6 +404,8 @@ pub fn read_local_achievements(steam_root: &Path, app_id: u64) -> Result<SteamAc
                 .icon_gray
                 .as_deref()
                 .and_then(|n| resolve_icon(&icon_dir, n));
+            let icon_hash = entry.icon.as_deref().and_then(normalize_icon_hash);
+            let icon_gray_hash = entry.icon_gray.as_deref().and_then(normalize_icon_hash);
             Some(SteamAchievement {
                 api_name: entry.api_name,
                 name: entry.name,
@@ -295,6 +413,8 @@ pub fn read_local_achievements(steam_root: &Path, app_id: u64) -> Result<SteamAc
                 hidden: entry.hidden,
                 icon,
                 icon_gray,
+                icon_hash,
+                icon_gray_hash,
                 unlocked,
                 unlocked_at,
             })
@@ -417,6 +537,62 @@ mod tests {
         let two = &set.achievements[1];
         assert!(!two.unlocked);
         assert!(two.hidden);
+    }
+
+    #[test]
+    fn icon_hashes_are_normalised_and_sanitised() {
+        assert_eq!(normalize_icon_hash("abc123.jpg"), Some("abc123".to_string()));
+        assert_eq!(normalize_icon_hash("  abc-1_x "), Some("abc-1_x".to_string()));
+        assert_eq!(normalize_icon_hash(""), None);
+        assert_eq!(normalize_icon_hash("../x"), None);
+        assert_eq!(normalize_icon_hash("a b"), None);
+    }
+
+    fn achievement_with_hashes(color: &str, gray: &str) -> SteamAchievement {
+        SteamAchievement {
+            api_name: "A".into(),
+            name: "A".into(),
+            description: String::new(),
+            hidden: false,
+            icon: None,
+            icon_gray: None,
+            icon_hash: Some(color.into()),
+            icon_gray_hash: Some(gray.into()),
+            unlocked: false,
+            unlocked_at: None,
+        }
+    }
+
+    #[test]
+    fn missing_icons_are_filled_from_the_ugl_cache_without_downloading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = achievement_icon_dir(tmp.path(), 220);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("color.jpg"), b"jpg").unwrap();
+
+        let mut set = SteamAchievementSet {
+            app_id: 220,
+            achievements: vec![achievement_with_hashes("color", "gris")],
+            progress_found: true,
+            warnings: vec![],
+        };
+        let report = resolve_missing_icons(&mut set, tmp.path(), false);
+
+        assert!(set.achievements[0].icon.is_some());
+        assert!(set.achievements[0].icon_gray.is_none());
+        assert_eq!(report.from_cache, 1);
+        assert_eq!(report.still_missing, 1);
+        assert_eq!(report.downloaded, 0);
+    }
+
+    #[test]
+    fn user_stats_modified_reports_the_newest_progress_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stats_dir = tmp.path().join("appcache").join("stats");
+        fs::create_dir_all(&stats_dir).unwrap();
+        assert!(user_stats_modified(tmp.path(), 220).is_none());
+        fs::write(stats_dir.join("UserGameStats_1_220.bin"), b"x").unwrap();
+        assert!(user_stats_modified(tmp.path(), 220).unwrap() > 1_600_000_000);
     }
 
     #[test]

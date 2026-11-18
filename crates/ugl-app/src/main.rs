@@ -2,17 +2,22 @@
 #![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use std::cell::RefCell;
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use ugl_core::diagnostics;
 use ugl_core::integrations::manual::{self, FolderScan};
 use ugl_core::achievement_engine::AchievementView;
+use ugl_core::application::SteamAchievementJob;
 use ugl_core::domain::format_date;
+use ugl_core::icons;
 use ugl_core::integrations::steam;
-use ugl_core::integrations::steam_achievements::{self, SteamAchievementSet};
-use ugl_core::{AppPaths, Core, GameId, LaunchKind, SortOrder};
+use ugl_core::integrations::steam_achievements;
+use ugl_core::watcher::{SteamWatcher, WatchEvent};
+use ugl_core::{AppPaths, Core, Game, GameId, LaunchKind, SortOrder};
 
 slint::include_modules!();
 
@@ -22,10 +27,56 @@ struct AppState {
     search: Mutex<String>,
     /// Resultado del último análisis de carpeta, a la espera de que el usuario confirme.
     pending_scan: Mutex<Option<FolderScan>>,
+    /// Caché de imágenes de UGL (iconos de juegos y de logros).
+    cache_dir: PathBuf,
+    /// Evita lanzar dos extractores de iconos a la vez.
+    icon_worker_running: AtomicBool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+thread_local! {
+    // Imágenes ya decodificadas (solo en el hilo de la interfaz). Evita releer el disco en cada
+    // búsqueda o cambio de filtro. Solo se recuerdan las que existen: una que aparezca después
+    // (por ejemplo, tras descargarla) se cargará en el siguiente repintado.
+    static IMAGE_CACHE: RefCell<HashMap<PathBuf, slint::Image>> = RefCell::new(HashMap::new());
+}
+
+fn cached_image(path: &Path) -> Option<slint::Image> {
+    IMAGE_CACHE.with(|cache| {
+        if let Some(hit) = cache.borrow().get(path) {
+            return Some(hit.clone());
+        }
+        let loaded = slint::Image::load_from_path(path).ok()?;
+        cache
+            .borrow_mut()
+            .insert(path.to_path_buf(), loaded.clone());
+        Some(loaded)
+    })
+}
+
+fn forget_image(path: &Path) {
+    IMAGE_CACHE.with(|cache| {
+        cache.borrow_mut().remove(path);
+    });
+}
+
+fn game_icon(game: &Game) -> Option<slint::Image> {
+    game.icon_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .and_then(|path| cached_image(Path::new(path)))
+}
+
+fn initial_of(title: &str) -> SharedString {
+    title
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_default()
+        .into()
 }
 
 fn main() {
@@ -55,6 +106,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         core: Mutex::new(core),
         search: Mutex::new(String::new()),
         pending_scan: Mutex::new(None),
+        cache_dir: paths.cache_dir.clone(),
+        icon_worker_running: AtomicBool::new(false),
     });
 
     let ui = MainWindow::new()?;
@@ -63,12 +116,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_db_path(paths.db_path.display().to_string().into());
     ui.set_log_path(paths.log_path.display().to_string().into());
     ui.set_sort_index(lock(&state.core).sort_order().index());
+    {
+        let core = lock(&state.core);
+        ui.set_auto_update(core.auto_update_enabled());
+        ui.set_download_icons(core.download_icons_enabled());
+    }
 
     wire_library(&ui, &state);
     wire_import(&ui, &state);
     wire_detail(&ui, &state);
     wire_achievements(&ui, &state);
+    wire_settings(&ui, &state);
     refresh_games(&ui, &state);
+    restart_automation(&ui, &state);
+    startup_sync(ui.as_weak(), state.clone());
 
     ui.run()?;
     Ok(())
@@ -110,12 +171,18 @@ fn refresh_games(ui: &MainWindow, state: &AppState) {
         Ok(games) => {
             let items: Vec<GameItem> = games
                 .iter()
-                .map(|game| GameItem {
-                    id: game.id as i32,
-                    title: game.title.clone().into(),
-                    source: source_label(&game.source).into(),
-                    ach_total: game.achievements_total as i32,
-                    ach_unlocked: game.achievements_unlocked as i32,
+                .map(|game| {
+                    let image = game_icon(game);
+                    GameItem {
+                        id: game.id as i32,
+                        title: game.title.clone().into(),
+                        source: source_label(&game.source).into(),
+                        ach_total: game.achievements_total as i32,
+                        ach_unlocked: game.achievements_unlocked as i32,
+                        has_icon: image.is_some(),
+                        icon: image.unwrap_or_default(),
+                        initial: initial_of(&game.title),
+                    }
                 })
                 .collect();
             ui.set_games(ModelRc::new(VecModel::from(items)));
@@ -162,8 +229,12 @@ fn show_detail(ui: &MainWindow, state: &AppState, id: GameId) {
         LaunchKind::Executable => (game.launch_target.clone(), true, true),
         LaunchKind::SteamUri => (format!("Steam (AppID {})", game.launch_target), false, false),
     };
+    let image = game_icon(&game);
     ui.set_detail(GameDetail {
         id: game.id as i32,
+        has_icon: image.is_some(),
+        icon: image.unwrap_or_default(),
+        initial: initial_of(&game.title),
         title: game.title.clone().into(),
         source: source_label(&game.source).into(),
         install_path: game.install_path.display().to_string().into(),
@@ -355,6 +426,7 @@ fn wire_import(ui: &MainWindow, state: &Arc<AppState>) {
                     };
                     set_status(&ui, message);
                     refresh_games(&ui, &state);
+                    kick_icon_worker(ui.as_weak(), state.clone());
                 }
                 Err(err) => {
                     // El diálogo sigue abierto para que el usuario pueda corregir.
@@ -489,6 +561,9 @@ fn on_steam_scanned(
             set_status(ui, message);
             ui.set_current_view(0);
             refresh_games(ui, state);
+            // Ya se conocen las carpetas de Steam: se vigilan y se buscan los iconos.
+            restart_automation(ui, state);
+            kick_icon_worker(ui.as_weak(), state.clone());
         }
         Err(err) => {
             diagnostics::error(&format!("No se pudo guardar la importación de Steam: {err}"));
@@ -536,6 +611,7 @@ fn wire_detail(ui: &MainWindow, state: &Arc<AppState>) {
                         Ok(()) => {
                             set_status(&ui, "Ejecutable actualizado.");
                             show_detail(&ui, &state, id);
+                            kick_icon_worker(ui.as_weak(), state.clone());
                         }
                         Err(err) => {
                             set_status(&ui, format!("No se pudo cambiar el ejecutable: {err}"))
@@ -750,7 +826,7 @@ fn achievement_item(view: &AchievementView) -> AchievementItem {
     let image = if hidden_locked {
         None
     } else {
-        path.and_then(|p| slint::Image::load_from_path(p).ok())
+        path.and_then(|p| cached_image(p))
     };
 
     let date_text = if view.unlocked {
@@ -799,30 +875,60 @@ fn start_achievement_refresh(
     win.set_busy(true);
     win.set_status_text("Leyendo la caché local de Steam…".into());
 
-    let weak = win.as_weak();
     let main = main.clone();
     let state = state.clone();
     std::thread::spawn(move || {
-        let result = steam_achievements::read_local_achievements(&job.steam_root, job.app_id);
-        let _ = weak.upgrade_in_event_loop(move |win| {
-            on_achievements_read(&win, &main, &state, id, result);
+        refresh_achievements_blocking(&main, &state, id, &job);
+    });
+}
+
+/// Avisa a la interfaz de que los logros de un juego cambiaron: repinta la biblioteca (insignias)
+/// y, si la ventana de logros muestra ese juego, también la lista.
+fn notify_achievements(
+    main: &slint::Weak<MainWindow>,
+    state: &Arc<AppState>,
+    id: GameId,
+    message: Option<String>,
+    busy: bool,
+) {
+    let state = state.clone();
+    let _ = main.upgrade_in_event_loop(move |ui| {
+        refresh_games(&ui, &state);
+        ACH_WINDOW.with(|slot| {
+            if let Some(win) = slot.borrow().as_ref() {
+                if win.get_game_id() as GameId == id {
+                    win.set_busy(busy);
+                    if let Some(text) = message {
+                        win.set_status_text(text.into());
+                    }
+                    render_achievements(win, &state);
+                }
+            }
         });
     });
 }
 
-fn on_achievements_read(
-    win: &AchievementsWindow,
+/// Lee, guarda y completa con imágenes los logros de un juego de Steam. Bloquea: ejecutar siempre
+/// en un hilo aparte (lo hacen el botón «Actualizar» y el vigilante de carpetas).
+fn refresh_achievements_blocking(
     main: &slint::Weak<MainWindow>,
     state: &Arc<AppState>,
     id: GameId,
-    result: ugl_core::Result<SteamAchievementSet>,
+    job: &SteamAchievementJob,
 ) {
-    win.set_busy(false);
-    let set = match result {
+    let allow_download = lock(&state.core).download_icons_enabled();
+
+    let mut set = match steam_achievements::read_local_achievements(&job.steam_root, job.app_id) {
         Ok(set) => set,
         Err(err) => {
             diagnostics::warn(&format!("No se pudieron leer los logros del juego {id}: {err}"));
-            win.set_status_text(format!("No se pudieron leer los logros: {err}").into());
+            notify_achievements(
+                main,
+                state,
+                id,
+                Some(format!("No se pudieron leer los logros: {err}")),
+                false,
+            );
             return;
         }
     };
@@ -830,27 +936,276 @@ fn on_achievements_read(
         diagnostics::warn(&format!("Logros de Steam: {warning}"));
     }
 
+    // 1) Guardar enseguida, con las imágenes que ya estén en disco.
+    let local = steam_achievements::resolve_missing_icons(&mut set, &state.cache_dir, false);
     let saved = lock(&state.core).save_steam_achievements(id, &set);
-    match saved {
-        Ok(count) => {
-            let mut message = format!("{count} logros leídos de la caché local de Steam.");
-            if !set.progress_found {
-                message.push_str(
-                    " No se encontró tu progreso guardado: los logros pueden aparecer como bloqueados.",
-                );
-            }
-            // La ventana es única: solo se repinta si sigue mostrando este mismo juego.
-            if win.get_game_id() as GameId == id {
-                win.set_status_text(message.into());
-                render_achievements(win, state);
-            }
-            if let Some(main_ui) = main.upgrade() {
-                refresh_games(&main_ui, state);
+    if let Err(err) = saved {
+        diagnostics::error(&format!("No se pudieron guardar los logros: {err}"));
+        notify_achievements(
+            main,
+            state,
+            id,
+            Some(format!("No se pudieron guardar los logros: {err}")),
+            false,
+        );
+        return;
+    }
+    let downloading = allow_download && local.still_missing > 0;
+    let mut message = format!(
+        "{} logros leídos de la caché local de Steam.",
+        set.achievements.len()
+    );
+    if !set.progress_found {
+        message.push_str(
+            " No se encontró tu progreso guardado: los logros pueden aparecer como bloqueados.",
+        );
+    }
+    if downloading {
+        message.push_str(" Descargando imágenes…");
+    }
+    notify_achievements(main, state, id, Some(message), downloading);
+
+    // 2) Descargar las imágenes que falten, sin bloquear la interfaz.
+    if downloading {
+        let report = steam_achievements::resolve_missing_icons(&mut set, &state.cache_dir, true);
+        if report.downloaded > 0 {
+            let saved = lock(&state.core).save_steam_achievements(id, &set);
+            if let Err(err) = saved {
+                diagnostics::error(&format!("No se pudieron guardar las imágenes: {err}"));
             }
         }
-        Err(err) => {
-            diagnostics::error(&format!("No se pudieron guardar los logros: {err}"));
-            win.set_status_text(format!("No se pudieron guardar los logros: {err}").into());
+        let message = if report.failed > 0 {
+            format!(
+                "{} imágenes descargadas; {} no se pudieron descargar (¿sin conexión?).",
+                report.downloaded, report.failed
+            )
+        } else {
+            format!("{} imágenes descargadas.", report.downloaded)
+        };
+        notify_achievements(main, state, id, Some(message), false);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Automatización: vigilar Steam, buscar iconos y ponerse al día al arrancar
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    // El vigilante vive en el hilo de la interfaz; al soltarlo se detiene todo.
+    static STEAM_WATCHER: RefCell<Option<SteamWatcher>> = RefCell::new(None);
+}
+
+/// (Re)inicia la vigilancia según las preferencias y las carpetas de Steam conocidas.
+fn restart_automation(ui: &MainWindow, state: &Arc<AppState>) {
+    let (enabled, dirs) = {
+        let core = lock(&state.core);
+        (core.auto_update_enabled(), core.steam_watch_dirs())
+    };
+    // Primero se detiene la anterior (si la hay).
+    STEAM_WATCHER.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+    if !enabled || dirs.is_empty() {
+        return;
+    }
+
+    let weak = ui.as_weak();
+    let handler_state = state.clone();
+    let started = SteamWatcher::start(&dirs, move |event| {
+        handle_watch_event(&weak, &handler_state, event);
+    });
+    match started {
+        Ok(watcher) => STEAM_WATCHER.with(|slot| {
+            *slot.borrow_mut() = Some(watcher);
+        }),
+        Err(err) => diagnostics::warn(&format!("Vigilancia de Steam desactivada: {err}")),
+    }
+}
+
+/// Se ejecuta en el hilo del vigilante, ya sin ráfagas repetidas.
+fn handle_watch_event(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>, event: WatchEvent) {
+    match event {
+        WatchEvent::LibraryChanged => sync_steam_library(weak, state),
+        WatchEvent::AchievementsChanged(app_id) => {
+            let prepared = {
+                let core = lock(&state.core);
+                core.find_steam_game(app_id)
+                    .map(|id| (id, core.steam_achievement_job(id)))
+            };
+            // Solo juegos que están en la biblioteca.
+            if let Some((id, Ok(job))) = prepared {
+                refresh_achievements_blocking(weak, state, id, &job);
+            }
         }
     }
+}
+
+/// Vuelve a leer los manifiestos de Steam e importa lo que sea nuevo. Bloquea (hilo aparte).
+/// Solo mira archivos `appmanifest`: es una lectura ligera, no un escaneo de los juegos.
+fn sync_steam_library(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>) {
+    let root = lock(&state.core).steam_root();
+    let Some(root) = root else {
+        return;
+    };
+    let scan = match steam::scan_steam_folder(&root) {
+        Ok(scan) => scan,
+        Err(err) => {
+            diagnostics::warn(&format!("No se pudo releer la carpeta de Steam: {err}"));
+            return;
+        }
+    };
+    for warning in &scan.warnings {
+        diagnostics::warn(&format!("Steam: {warning}"));
+    }
+
+    let (before, result, after) = {
+        let mut core = lock(&state.core);
+        let before = core.steam_watch_dirs();
+        let result = core.import_steam(&scan);
+        let after = core.steam_watch_dirs();
+        (before, result, after)
+    };
+    let summary = match result {
+        Ok(summary) => summary,
+        Err(err) => {
+            diagnostics::warn(&format!("No se pudo actualizar la biblioteca de Steam: {err}"));
+            return;
+        }
+    };
+    let libraries_changed = before != after;
+    if summary.added == 0 && summary.updated == 0 && !libraries_changed {
+        return;
+    }
+
+    let state = state.clone();
+    let _ = weak.upgrade_in_event_loop(move |ui| {
+        if summary.added > 0 {
+            set_status(
+                &ui,
+                format!(
+                    "Steam: {} juego(s) nuevo(s) detectado(s) automáticamente.",
+                    summary.added
+                ),
+            );
+        }
+        refresh_games(&ui, &state);
+        if libraries_changed {
+            restart_automation(&ui, &state);
+        }
+        kick_icon_worker(ui.as_weak(), state.clone());
+    });
+}
+
+/// Busca en segundo plano el icono de los juegos que aún no lo tienen. Si ya hay un extractor
+/// trabajando, no hace nada (ese mismo repasará los juegos nuevos al terminar su tanda).
+fn kick_icon_worker(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
+    if state.icon_worker_running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut handled: HashSet<GameId> = HashSet::new();
+        loop {
+            let jobs: Vec<icons::IconJob> = lock(&state.core)
+                .icon_jobs(25)
+                .into_iter()
+                .filter(|job| !handled.contains(&job.game_id))
+                .collect();
+            if jobs.is_empty() {
+                break;
+            }
+
+            let mut results: Vec<(GameId, Option<PathBuf>)> = Vec::new();
+            for job in &jobs {
+                handled.insert(job.game_id);
+                let icon = match icons::extract_and_cache(job, &state.cache_dir) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        diagnostics::info(&format!(
+                            "Sin icono para el juego {}: {err}",
+                            job.game_id
+                        ));
+                        None
+                    }
+                };
+                results.push((job.game_id, icon));
+            }
+            {
+                let mut core = lock(&state.core);
+                for (id, icon) in &results {
+                    core.record_icon_result(*id, icon.as_deref());
+                }
+            }
+
+            let changed: Vec<PathBuf> = results.iter().filter_map(|(_, p)| p.clone()).collect();
+            let state_for_ui = state.clone();
+            let _ = weak.upgrade_in_event_loop(move |ui| {
+                for path in &changed {
+                    forget_image(path);
+                }
+                refresh_games(&ui, &state_for_ui);
+            });
+        }
+        state.icon_worker_running.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Al arrancar: se ponen al día los juegos y logros que cambiaron con UGL cerrado y se buscan
+/// los iconos pendientes. Todo en segundo plano.
+fn startup_sync(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
+    std::thread::spawn(move || {
+        let auto = lock(&state.core).auto_update_enabled();
+        if auto {
+            sync_steam_library(&weak, &state);
+            let stale = lock(&state.core).stale_achievement_jobs();
+            for (id, job) in stale {
+                refresh_achievements_blocking(&weak, &state, id, &job);
+            }
+        }
+        kick_icon_worker(weak.clone(), state.clone());
+    });
+}
+
+fn wire_settings(ui: &MainWindow, state: &Arc<AppState>) {
+    ui.on_auto_update_toggled({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |enabled| {
+            let saved = lock(&state.core).set_auto_update_enabled(enabled);
+            if let Err(err) = saved {
+                diagnostics::warn(&format!("No se pudo guardar el ajuste: {err}"));
+            }
+            if let Some(ui) = weak.upgrade() {
+                restart_automation(&ui, &state);
+                set_status(
+                    &ui,
+                    if enabled {
+                        "Actualización automática activada."
+                    } else {
+                        "Actualización automática desactivada."
+                    },
+                );
+            }
+        }
+    });
+
+    ui.on_download_icons_toggled({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |enabled| {
+            let saved = lock(&state.core).set_download_icons_enabled(enabled);
+            if let Err(err) = saved {
+                diagnostics::warn(&format!("No se pudo guardar el ajuste: {err}"));
+            }
+            if let Some(ui) = weak.upgrade() {
+                set_status(
+                    &ui,
+                    if enabled {
+                        "Las imágenes de logros que falten se descargarán de Steam."
+                    } else {
+                        "UGL no descargará imágenes: usará solo las que ya existan en tu equipo."
+                    },
+                );
+            }
+        }
+    });
 }

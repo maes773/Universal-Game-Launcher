@@ -126,6 +126,18 @@ pub fn store(
     Ok(records.len())
 }
 
+/// Cuándo se sincronizaron por última vez los logros de este juego (Unix), si alguna vez.
+pub fn synced_at(conn: &Connection, game_id: GameId) -> Result<Option<i64>> {
+    let value: Option<i64> = conn.query_row(
+        "SELECT MAX(u.updated_at)
+         FROM unlocks u JOIN achievements a ON a.id = u.achievement_id
+         WHERE a.game_id = ?1",
+        params![game_id],
+        |row| row.get(0),
+    )?;
+    Ok(value)
+}
+
 /// Desbloqueados primero (los más recientes arriba), después los pendientes en su orden original.
 pub fn list(conn: &Connection, game_id: GameId) -> Result<Vec<AchievementView>> {
     let mut stmt = conn.prepare_cached(

@@ -25,6 +25,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "logros",
         sql: include_str!("sql/0002_achievements.sql"),
     },
+    Migration {
+        version: 3,
+        name: "iconos de juegos",
+        sql: include_str!("sql/0003_game_icons.sql"),
+    },
 ];
 
 pub fn latest_version() -> i32 {

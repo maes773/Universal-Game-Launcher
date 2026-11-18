@@ -89,6 +89,8 @@ pub struct Game {
     pub last_played_at: Option<i64>,
     pub achievements_total: u32,
     pub achievements_unlocked: u32,
+    /// None = sin intentar; Some("") = sin icono; Some(ruta) = PNG en la caché.
+    pub icon_path: Option<String>,
 }
 
 /// Lo que una integración entrega al registro. Es el único contrato entre
