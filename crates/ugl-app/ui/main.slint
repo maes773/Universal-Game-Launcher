@@ -1,0 +1,950 @@
+// UGL 0.1 — Foundation. Interfaz funcional y sencilla.
+// El diseño esqueumórfico (estanterías, cajas, cartuchos) llega en una etapa posterior.
+
+import { Button, LineEdit, ComboBox, ListView } from "std-widgets.slint";
+
+export struct GameItem {
+    id: int,
+    title: string,
+    source: string,
+    ach-total: int,
+    ach-unlocked: int,
+}
+
+export struct ExeItem {
+    label: string,
+    detail: string,
+    suggested: bool,
+}
+
+export struct GameDetail {
+    id: int,
+    title: string,
+    source: string,
+    install-path: string,
+    launch-target: string,
+    status: string,
+    can-change-exe: bool,
+    can-change-path: bool,
+    ach-total: int,
+    ach-unlocked: int,
+    can-show-achievements: bool,
+}
+
+export struct AchievementItem {
+    name: string,
+    description: string,
+    date-text: string,
+    provenance: string,
+    icon: image,
+    has-icon: bool,
+    unlocked: bool,
+    hidden: bool,
+}
+
+component NavButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked();
+
+    height: 44px;
+    border-radius: 6px;
+    background: root.selected ? #3b2b1f : transparent;
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        x: 14px;
+        y: 0px;
+        height: parent.height;
+        text: root.label;
+        color: root.selected ? #f2e6d4 : #b9a58e;
+        font-size: 15px;
+        vertical-alignment: center;
+    }
+}
+
+component AchievementBadge inherits Rectangle {
+    in property <int> unlocked;
+    in property <int> total;
+    callback clicked();
+
+    width: 104px;
+    height: 30px;
+    border-radius: 15px;
+    border-width: 1px;
+    border-color: #c98a3b;
+    background: badge-area.has-hover ? #4a3626 : #2a1f18;
+
+    badge-area := TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: "Logros " + root.unlocked + "/" + root.total;
+        color: #e8b96a;
+        font-size: 12px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component ImportCard inherits Rectangle {
+    in property <string> heading;
+    in property <string> description;
+    in property <string> button-text;
+    in property <bool> button-enabled: true;
+    callback activated();
+
+    background: #2a1f18;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: #4a3626;
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 10px;
+
+        Text {
+            text: root.heading;
+            color: #f2e6d4;
+            font-size: 18px;
+            font-weight: 700;
+        }
+        Text {
+            text: root.description;
+            color: #b9a58e;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+        Button {
+            text: root.button-text;
+            enabled: root.button-enabled;
+            primary: true;
+            clicked => { root.activated(); }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "UGL — Universal Game Launcher";
+    preferred-width: 1100px;
+    preferred-height: 720px;
+    min-width: 900px;
+    min-height: 600px;
+    background: #1c1511;
+
+    // Estado general
+    in property <[GameItem]> games;
+    in property <string> status-text;
+    in property <bool> busy: false;
+    in property <string> version-text;
+    in property <string> data-dir;
+    in property <string> db-path;
+    in property <string> log-path;
+    in-out property <int> current-view: 0;
+    in-out property <int> sort-index: 0;
+
+    // Diálogo de importación de un juego individual
+    in property <bool> import-dialog-visible: false;
+    in property <string> import-folder;
+    in-out property <string> import-name;
+    in property <[ExeItem]> exe-candidates;
+    in-out property <int> selected-exe: -1;
+    in property <string> scan-note;
+
+    // Ficha del juego
+    in property <bool> detail-visible: false;
+    in property <GameDetail> detail;
+    in-out property <bool> confirm-remove: false;
+
+    callback search-changed(string);
+    callback sort-changed(int);
+    callback game-clicked(int);
+    callback play-clicked(int);
+    callback import-folder-clicked();
+    callback import-steam-clicked();
+    callback browse-exe-clicked();
+    callback import-confirm(string, int);
+    callback import-cancel();
+    callback detail-close();
+    callback change-exe-clicked(int);
+    callback change-path-clicked(int);
+    callback remove-clicked(int);
+    callback achievements-clicked(int);
+
+    HorizontalLayout {
+        // Barra lateral
+        Rectangle {
+            width: 210px;
+            background: #140e0a;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 6px;
+                alignment: start;
+
+                Text {
+                    text: "UGL";
+                    color: #c98a3b;
+                    font-size: 28px;
+                    font-weight: 800;
+                }
+                Text {
+                    text: "Universal Game Launcher";
+                    color: #8a7662;
+                    font-size: 11px;
+                }
+                Rectangle { height: 18px; }
+                NavButton {
+                    label: "Biblioteca";
+                    selected: root.current-view == 0;
+                    clicked => { root.current-view = 0; }
+                }
+                NavButton {
+                    label: "Importar";
+                    selected: root.current-view == 1;
+                    clicked => { root.current-view = 1; }
+                }
+                NavButton {
+                    label: "Ajustes";
+                    selected: root.current-view == 2;
+                    clicked => { root.current-view = 2; }
+                }
+            }
+        }
+
+        // Contenido
+        VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
+
+            // ---- Biblioteca ----
+            if root.current-view == 0 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    LineEdit {
+                        placeholder-text: "Buscar en la biblioteca…";
+                        edited(text) => { root.search-changed(text); }
+                    }
+                    ComboBox {
+                        width: 230px;
+                        model: ["Ordenar por título", "Jugados recientemente", "Añadidos recientemente"];
+                        current-index: root.sort-index;
+                        selected(value) => { root.sort-changed(self.current-index); }
+                    }
+                }
+
+                if root.games.length == 0 : Rectangle {
+                    vertical-stretch: 1;
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: "Tu biblioteca está vacía.\nVe a «Importar» para añadir un juego o tu carpeta de Steam.";
+                        color: #8a7662;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+
+                if root.games.length > 0 : ListView {
+                    vertical-stretch: 1;
+                    for game in root.games : Rectangle {
+                        height: 58px;
+                        border-radius: 6px;
+                        background: row-area.has-hover ? #2f2218 : transparent;
+
+                        row-area := TouchArea {
+                            clicked => { root.game-clicked(game.id); }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 10px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 12px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: game.title;
+                                    color: #f2e6d4;
+                                    font-size: 15px;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: game.source;
+                                    color: #8a7662;
+                                    font-size: 11px;
+                                }
+                            }
+                            if game.ach-total > 0 : VerticalLayout {
+                                alignment: center;
+                                AchievementBadge {
+                                    unlocked: game.ach-unlocked;
+                                    total: game.ach-total;
+                                    clicked => { root.achievements-clicked(game.id); }
+                                }
+                            }
+                            Button {
+                                text: "Jugar";
+                                primary: true;
+                                width: 90px;
+                                clicked => { root.play-clicked(game.id); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- Importar ----
+            if root.current-view == 1 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 16px;
+                alignment: start;
+
+                Text {
+                    text: "Importar";
+                    color: #f2e6d4;
+                    font-size: 24px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "UGL solo importa cuando tú lo pides. No copia, mueve ni modifica ningún archivo de tus juegos.";
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                ImportCard {
+                    height: 170px;
+                    heading: "Importar juego individual";
+                    description: "Elige la carpeta donde está instalado el juego. UGL buscará los ejecutables y te dejará elegir cuál usar para iniciarlo.";
+                    button-text: "Elegir carpeta del juego…";
+                    button-enabled: !root.busy;
+                    activated => { root.import-folder-clicked(); }
+                }
+                ImportCard {
+                    height: 170px;
+                    heading: "Importar carpeta de Steam";
+                    description: "Selecciona tu carpeta de Steam (o una biblioteca adicional). UGL lee los archivos locales appmanifest y libraryfolders.vdf: no necesita iniciar sesión ni conexión.";
+                    button-text: "Elegir carpeta de Steam…";
+                    button-enabled: !root.busy;
+                    activated => { root.import-steam-clicked(); }
+                }
+            }
+
+            // ---- Ajustes ----
+            if root.current-view == 2 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 10px;
+                alignment: start;
+
+                Text {
+                    text: "Ajustes";
+                    color: #f2e6d4;
+                    font-size: 24px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "Versión: " + root.version-text;
+                    color: #b9a58e;
+                    font-size: 13px;
+                }
+                Text {
+                    text: "Carpeta de datos: " + root.data-dir;
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Base de datos: " + root.db-path;
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Registro de diagnóstico: " + root.log-path;
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "El orden de la biblioteca y la última carpeta de importación se guardan automáticamente.";
+                    color: #8a7662;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+
+            // ---- Barra de estado ----
+            Text {
+                text: root.status-text;
+                color: #b9a58e;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    // ---- Diálogo: importar juego individual ----
+    if root.import-dialog-visible : Rectangle {
+        background: #000000c0;
+
+        TouchArea { }
+
+        Rectangle {
+            width: Math.min(680px, parent.width - 48px);
+            height: Math.min(580px, parent.height - 48px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #2a1f18;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #4a3626;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+
+                Text {
+                    text: "Importar juego";
+                    color: #f2e6d4;
+                    font-size: 20px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.import-folder;
+                    color: #8a7662;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+                Text {
+                    text: "Nombre del juego";
+                    color: #b9a58e;
+                    font-size: 12px;
+                }
+                LineEdit {
+                    text <=> root.import-name;
+                    placeholder-text: "Nombre del juego";
+                }
+                Text {
+                    text: root.exe-candidates.length == 0 ? "No se encontraron ejecutables en esta carpeta. Puedes buscar uno manualmente." : "Ejecutable para iniciar el juego";
+                    color: #b9a58e;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for exe[i] in root.exe-candidates : Rectangle {
+                        height: 46px;
+                        border-radius: 6px;
+                        background: root.selected-exe == i ? #4a3626 : (exe-area.has-hover ? #36281d : transparent);
+
+                        exe-area := TouchArea {
+                            clicked => { root.selected-exe = i; }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 10px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: exe.label;
+                                    color: #f2e6d4;
+                                    font-size: 13px;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: exe.detail;
+                                    color: #8a7662;
+                                    font-size: 11px;
+                                }
+                            }
+                            Text {
+                                text: exe.suggested ? "Sugerido" : "";
+                                color: #c98a3b;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+                Text {
+                    text: root.scan-note;
+                    visible: root.scan-note != "";
+                    color: #c98a3b;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: "Buscar otro ejecutable…";
+                        clicked => { root.browse-exe-clicked(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cancelar";
+                        clicked => { root.import-cancel(); }
+                    }
+                    Button {
+                        text: "Añadir a la biblioteca";
+                        primary: true;
+                        enabled: root.selected-exe >= 0 && root.import-name != "";
+                        clicked => { root.import-confirm(root.import-name, root.selected-exe); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Ficha del juego ----
+    if root.detail-visible : Rectangle {
+        background: #000000c0;
+
+        TouchArea { }
+
+        Rectangle {
+            width: Math.min(680px, parent.width - 48px);
+            height: Math.min(440px, parent.height - 48px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #2a1f18;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #4a3626;
+
+            VerticalLayout {
+                padding: 22px;
+                spacing: 8px;
+
+                Text {
+                    text: root.detail.title;
+                    color: #f2e6d4;
+                    font-size: 22px;
+                    font-weight: 700;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Origen: " + root.detail.source;
+                    color: #b9a58e;
+                    font-size: 13px;
+                }
+                Text {
+                    text: "Carpeta: " + root.detail.install-path;
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Inicio: " + root.detail.launch-target;
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Estado: " + root.detail.status;
+                    color: #c98a3b;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+                if root.confirm-remove : Text {
+                    text: "Se quitará solo de la biblioteca de UGL. No se borra ningún archivo del juego.";
+                    color: #c98a3b;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: "Jugar";
+                        primary: true;
+                        clicked => { root.play-clicked(root.detail.id); }
+                    }
+                    if root.detail.can-show-achievements : Button {
+                        text: root.detail.ach-total > 0 ? "Logros (" + root.detail.ach-unlocked + "/" + root.detail.ach-total + ")" : "Logros";
+                        clicked => { root.achievements-clicked(root.detail.id); }
+                    }
+                    Button {
+                        text: "Cambiar ejecutable…";
+                        enabled: root.detail.can-change-exe;
+                        clicked => { root.change-exe-clicked(root.detail.id); }
+                    }
+                    Button {
+                        text: "Cambiar carpeta…";
+                        enabled: root.detail.can-change-path;
+                        clicked => { root.change-path-clicked(root.detail.id); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    if !root.confirm-remove : Button {
+                        text: "Quitar de la biblioteca";
+                        clicked => { root.confirm-remove = true; }
+                    }
+                    if root.confirm-remove : Button {
+                        text: "Sí, quitar";
+                        clicked => { root.remove-clicked(root.detail.id); }
+                    }
+                    if root.confirm-remove : Button {
+                        text: "Cancelar";
+                        clicked => { root.confirm-remove = false; }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cerrar";
+                        clicked => { root.detail-close(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ventana de logros: estructura de la «blade» de Xbox 360 con la paleta de UGL
+// ---------------------------------------------------------------------------
+
+component FilterChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked();
+
+    width: 124px;
+    height: 32px;
+    border-radius: 16px;
+    border-width: 1px;
+    border-color: #4a3626;
+    background: root.selected ? #c98a3b : #2a1f18;
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        color: root.selected ? #1c1511 : #b9a58e;
+        font-size: 13px;
+        font-weight: 700;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+}
+
+component AchievementRow inherits Rectangle {
+    in property <AchievementItem> item;
+    height: 92px;
+
+    Rectangle {
+        x: 0px;
+        y: 3px;
+        width: parent.width;
+        height: parent.height - 6px;
+        border-radius: 6px;
+        background: root.item.unlocked ? #2f2218 : #221813;
+        clip: true;
+
+        // Barra lateral: ámbar cuando está desbloqueado
+        Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 5px;
+            height: parent.height;
+            background: root.item.unlocked ? #c98a3b : #3b2b1f;
+        }
+
+        HorizontalLayout {
+            padding-left: 20px;
+            padding-right: 14px;
+            padding-top: 9px;
+            padding-bottom: 9px;
+            spacing: 14px;
+
+            // Icono (o estrella si no hay imagen en la caché local)
+            Rectangle {
+                width: 64px;
+                height: 64px;
+                border-radius: 4px;
+                border-width: 1px;
+                border-color: #4a3626;
+                background: #140e0a;
+                clip: true;
+
+                if root.item.has-icon : Image {
+                    x: 0px;
+                    y: 0px;
+                    width: parent.width;
+                    height: parent.height;
+                    source: root.item.icon;
+                    image-fit: contain;
+                    opacity: root.item.unlocked ? 1.0 : 0.5;
+                }
+                if !root.item.has-icon : Path {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 30px;
+                    height: 30px;
+                    viewbox-width: 24;
+                    viewbox-height: 24;
+                    commands: "M 12 2 L 15 9 L 22 9 L 16.5 13.5 L 18.5 21 L 12 16.5 L 5.5 21 L 7.5 13.5 L 2 9 L 9 9 Z";
+                    fill: root.item.unlocked ? #c98a3b : #4a3626;
+                }
+            }
+
+            // Nombre y descripción
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: 3px;
+
+                Text {
+                    text: root.item.name;
+                    color: root.item.unlocked ? #f2e6d4 : #b9a58e;
+                    font-size: 16px;
+                    font-weight: 700;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.item.description;
+                    color: #8a7662;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                    overflow: elide;
+                    max-height: 34px;
+                }
+            }
+
+            // Estado: marca de verificación, fecha y procedencia
+            VerticalLayout {
+                width: 150px;
+                alignment: center;
+                spacing: 4px;
+
+                if root.item.unlocked : HorizontalLayout {
+                    alignment: end;
+                    Path {
+                        width: 20px;
+                        height: 20px;
+                        viewbox-width: 24;
+                        viewbox-height: 24;
+                        commands: "M 3 13 L 9 19 L 21 5";
+                        stroke: #7fc15b;
+                        stroke-width: 3px;
+                    }
+                }
+                Text {
+                    text: root.item.date-text;
+                    color: root.item.unlocked ? #e8b96a : #6f5d4b;
+                    font-size: 11px;
+                    horizontal-alignment: right;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.item.provenance;
+                    color: #8a7662;
+                    font-size: 10px;
+                    horizontal-alignment: right;
+                }
+            }
+        }
+    }
+}
+
+export component AchievementsWindow inherits Window {
+    title: "UGL — Logros";
+    preferred-width: 780px;
+    preferred-height: 660px;
+    min-width: 640px;
+    min-height: 480px;
+    background: #1c1511;
+
+    in property <int> game-id;
+    in property <string> game-title;
+    in property <string> summary-text;
+    in property <string> percent-text;
+    in property <float> progress: 0.0;
+    in property <[AchievementItem]> items;
+    in property <string> status-text;
+    in property <bool> busy: false;
+    in-out property <int> filter: 0;
+
+    callback filter-changed(int);
+    callback refresh-clicked(int);
+    callback close-clicked();
+
+    VerticalLayout {
+        // Cabecera
+        Rectangle {
+            height: 124px;
+            background: #140e0a;
+
+            Rectangle {
+                x: 0px;
+                y: parent.height - 3px;
+                width: parent.width;
+                height: 3px;
+                background: #c98a3b;
+            }
+
+            VerticalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                padding-top: 18px;
+                padding-bottom: 18px;
+                spacing: 6px;
+
+                Text {
+                    text: "LOGROS";
+                    color: #c98a3b;
+                    font-size: 12px;
+                    font-weight: 800;
+                }
+                Text {
+                    text: root.game-title;
+                    color: #f2e6d4;
+                    font-size: 26px;
+                    font-weight: 700;
+                    overflow: elide;
+                }
+                HorizontalLayout {
+                    spacing: 14px;
+
+                    Text {
+                        text: root.summary-text;
+                        color: #b9a58e;
+                        font-size: 13px;
+                        vertical-alignment: center;
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        alignment: center;
+
+                        Rectangle {
+                            height: 10px;
+                            border-radius: 5px;
+                            border-width: 1px;
+                            border-color: #4a3626;
+                            background: #2a1f18;
+                            clip: true;
+
+                            Rectangle {
+                                x: 0px;
+                                y: 0px;
+                                width: parent.width * root.progress;
+                                height: parent.height;
+                                background: #c98a3b;
+                            }
+                        }
+                    }
+                    Text {
+                        text: root.percent-text;
+                        color: #e8b96a;
+                        font-size: 13px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
+
+        // Filtros y acciones
+        HorizontalLayout {
+            padding: 16px;
+            spacing: 10px;
+
+            FilterChip {
+                label: "Todos";
+                selected: root.filter == 0;
+                clicked => { root.filter-changed(0); }
+            }
+            FilterChip {
+                label: "Desbloqueados";
+                selected: root.filter == 1;
+                clicked => { root.filter-changed(1); }
+            }
+            FilterChip {
+                label: "Bloqueados";
+                selected: root.filter == 2;
+                clicked => { root.filter-changed(2); }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Button {
+                text: "Actualizar";
+                enabled: !root.busy;
+                clicked => { root.refresh-clicked(root.game-id); }
+            }
+            Button {
+                text: "Cerrar";
+                clicked => { root.close-clicked(); }
+            }
+        }
+
+        // Lista
+        VerticalLayout {
+            vertical-stretch: 1;
+            padding-left: 16px;
+            padding-right: 16px;
+
+            if root.items.length == 0 : Rectangle {
+                Text {
+                    width: parent.width;
+                    height: parent.height;
+                    text: "No hay logros para mostrar.";
+                    color: #8a7662;
+                    font-size: 15px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            if root.items.length > 0 : ListView {
+                for item in root.items : AchievementRow {
+                    item: item;
+                }
+            }
+        }
+
+        // Pie: estado y aviso de procedencia
+        Rectangle {
+            height: 62px;
+            background: #140e0a;
+
+            VerticalLayout {
+                padding-left: 24px;
+                padding-right: 24px;
+                padding-top: 8px;
+                padding-bottom: 8px;
+                spacing: 2px;
+
+                Text {
+                    text: root.status-text;
+                    color: #c98a3b;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Logros importados de la caché local de Steam. UGL no puede verificarlos oficialmente.";
+                    color: #8a7662;
+                    font-size: 10px;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}

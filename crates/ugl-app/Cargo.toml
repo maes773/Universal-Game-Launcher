@@ -1,0 +1,20 @@
+[package]
+name = "ugl-app"
+version.workspace = true
+edition.workspace = true
+description = "UGL (Universal Game Launcher): aplicación de escritorio"
+build = "build.rs"
+
+[[bin]]
+name = "ugl"
+path = "src/main.rs"
+
+[dependencies]
+ugl-core = { path = "../ugl-core" }
+# Interfaz gráfica.
+slint = "1.8"
+# Selectores nativos de archivos y carpetas.
+rfd = "0.15"
+
+[build-dependencies]
+slint-build = "1.8"
