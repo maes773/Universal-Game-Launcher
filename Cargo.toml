@@ -16,3 +16,10 @@ dirs = "5"
 lto = true
 codegen-units = 1
 strip = true
+
+[package]
+name = "ugl-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
