@@ -1,0 +1,560 @@
+// UGL 0.1 — Foundation. Interfaz funcional y sencilla.
+// El diseño esqueumórfico (estanterías, cajas, cartuchos) llega en una etapa posterior.
+
+import { Button, LineEdit, ComboBox, ListView } from "std-widgets.slint";
+
+export struct GameItem {
+    id: int,
+    title: string,
+    source: string,
+}
+
+export struct ExeItem {
+    label: string,
+    detail: string,
+    suggested: bool,
+}
+
+export struct GameDetail {
+    id: int,
+    title: string,
+    source: string,
+    install-path: string,
+    launch-target: string,
+    status: string,
+    can-change-exe: bool,
+    can-change-path: bool,
+}
+
+component NavButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> selected;
+    callback clicked();
+
+    height: 44px;
+    border-radius: 6px;
+    background: root.selected ? #3b2b1f : transparent;
+
+    TouchArea {
+        clicked => { root.clicked(); }
+    }
+
+    Text {
+        x: 14px;
+        y: 0px;
+        height: parent.height;
+        text: root.label;
+        color: root.selected ? #f2e6d4 : #b9a58e;
+        font-size: 15px;
+        vertical-alignment: center;
+    }
+}
+
+component ImportCard inherits Rectangle {
+    in property <string> heading;
+    in property <string> description;
+    in property <string> button-text;
+    in property <bool> button-enabled: true;
+    callback activated();
+
+    background: #2a1f18;
+    border-radius: 10px;
+    border-width: 1px;
+    border-color: #4a3626;
+
+    VerticalLayout {
+        padding: 20px;
+        spacing: 10px;
+
+        Text {
+            text: root.heading;
+            color: #f2e6d4;
+            font-size: 18px;
+            font-weight: 700;
+        }
+        Text {
+            text: root.description;
+            color: #b9a58e;
+            font-size: 13px;
+            wrap: word-wrap;
+        }
+        Button {
+            text: root.button-text;
+            enabled: root.button-enabled;
+            primary: true;
+            clicked => { root.activated(); }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "UGL — Universal Game Launcher";
+    preferred-width: 1100px;
+    preferred-height: 720px;
+    min-width: 900px;
+    min-height: 600px;
+    background: #1c1511;
+
+    // Estado general
+    in property <[GameItem]> games;
+    in property <string> status-text;
+    in property <bool> busy: false;
+    in property <string> version-text;
+    in property <string> data-dir;
+    in property <string> db-path;
+    in property <string> log-path;
+    in-out property <int> current-view: 0;
+    in-out property <int> sort-index: 0;
+
+    // Diálogo de importación de un juego individual
+    in property <bool> import-dialog-visible: false;
+    in property <string> import-folder;
+    in-out property <string> import-name;
+    in property <[ExeItem]> exe-candidates;
+    in-out property <int> selected-exe: -1;
+    in property <string> scan-note;
+
+    // Ficha del juego
+    in property <bool> detail-visible: false;
+    in property <GameDetail> detail;
+    in-out property <bool> confirm-remove: false;
+
+    callback search-changed(string);
+    callback sort-changed(int);
+    callback game-clicked(int);
+    callback play-clicked(int);
+    callback import-folder-clicked();
+    callback import-steam-clicked();
+    callback browse-exe-clicked();
+    callback import-confirm(string, int);
+    callback import-cancel();
+    callback detail-close();
+    callback change-exe-clicked(int);
+    callback change-path-clicked(int);
+    callback remove-clicked(int);
+
+    HorizontalLayout {
+        // Barra lateral
+        Rectangle {
+            width: 210px;
+            background: #140e0a;
+
+            VerticalLayout {
+                padding: 16px;
+                spacing: 6px;
+                alignment: start;
+
+                Text {
+                    text: "UGL";
+                    color: #c98a3b;
+                    font-size: 28px;
+                    font-weight: 800;
+                }
+                Text {
+                    text: "Universal Game Launcher";
+                    color: #8a7662;
+                    font-size: 11px;
+                }
+                Rectangle { height: 18px; }
+                NavButton {
+                    label: "Biblioteca";
+                    selected: root.current-view == 0;
+                    clicked => { root.current-view = 0; }
+                }
+                NavButton {
+                    label: "Importar";
+                    selected: root.current-view == 1;
+                    clicked => { root.current-view = 1; }
+                }
+                NavButton {
+                    label: "Ajustes";
+                    selected: root.current-view == 2;
+                    clicked => { root.current-view = 2; }
+                }
+            }
+        }
+
+        // Contenido
+        VerticalLayout {
+            padding: 20px;
+            spacing: 12px;
+
+            // ---- Biblioteca ----
+            if root.current-view == 0 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    LineEdit {
+                        placeholder-text: "Buscar en la biblioteca…";
+                        edited(text) => { root.search-changed(text); }
+                    }
+                    ComboBox {
+                        width: 230px;
+                        model: ["Ordenar por título", "Jugados recientemente", "Añadidos recientemente"];
+                        current-index: root.sort-index;
+                        selected(value) => { root.sort-changed(self.current-index); }
+                    }
+                }
+
+                if root.games.length == 0 : Rectangle {
+                    vertical-stretch: 1;
+                    Text {
+                        width: parent.width;
+                        height: parent.height;
+                        text: "Tu biblioteca está vacía.\nVe a «Importar» para añadir un juego o tu carpeta de Steam.";
+                        color: #8a7662;
+                        font-size: 16px;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        wrap: word-wrap;
+                    }
+                }
+
+                if root.games.length > 0 : ListView {
+                    vertical-stretch: 1;
+                    for game in root.games : Rectangle {
+                        height: 58px;
+                        border-radius: 6px;
+                        background: row-area.has-hover ? #2f2218 : transparent;
+
+                        row-area := TouchArea {
+                            clicked => { root.game-clicked(game.id); }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 14px;
+                            padding-right: 10px;
+                            padding-top: 8px;
+                            padding-bottom: 8px;
+                            spacing: 12px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: game.title;
+                                    color: #f2e6d4;
+                                    font-size: 15px;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: game.source;
+                                    color: #8a7662;
+                                    font-size: 11px;
+                                }
+                            }
+                            Button {
+                                text: "Jugar";
+                                primary: true;
+                                width: 90px;
+                                clicked => { root.play-clicked(game.id); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- Importar ----
+            if root.current-view == 1 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 16px;
+                alignment: start;
+
+                Text {
+                    text: "Importar";
+                    color: #f2e6d4;
+                    font-size: 24px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "UGL solo importa cuando tú lo pides. No copia, mueve ni modifica ningún archivo de tus juegos.";
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                ImportCard {
+                    height: 170px;
+                    heading: "Importar juego individual";
+                    description: "Elige la carpeta donde está instalado el juego. UGL buscará los ejecutables y te dejará elegir cuál usar para iniciarlo.";
+                    button-text: "Elegir carpeta del juego…";
+                    button-enabled: !root.busy;
+                    activated => { root.import-folder-clicked(); }
+                }
+                ImportCard {
+                    height: 170px;
+                    heading: "Importar carpeta de Steam";
+                    description: "Selecciona tu carpeta de Steam (o una biblioteca adicional). UGL lee los archivos locales appmanifest y libraryfolders.vdf: no necesita iniciar sesión ni conexión.";
+                    button-text: "Elegir carpeta de Steam…";
+                    button-enabled: !root.busy;
+                    activated => { root.import-steam-clicked(); }
+                }
+            }
+
+            // ---- Ajustes ----
+            if root.current-view == 2 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 10px;
+                alignment: start;
+
+                Text {
+                    text: "Ajustes";
+                    color: #f2e6d4;
+                    font-size: 24px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "Versión: " + root.version-text;
+                    color: #b9a58e;
+                    font-size: 13px;
+                }
+                Text {
+                    text: "Carpeta de datos: " + root.data-dir;
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Base de datos: " + root.db-path;
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Registro de diagnóstico: " + root.log-path;
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "El orden de la biblioteca y la última carpeta de importación se guardan automáticamente.";
+                    color: #8a7662;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+
+            // ---- Barra de estado ----
+            Text {
+                text: root.status-text;
+                color: #b9a58e;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+        }
+    }
+
+    // ---- Diálogo: importar juego individual ----
+    if root.import-dialog-visible : Rectangle {
+        background: #000000c0;
+
+        TouchArea { }
+
+        Rectangle {
+            width: Math.min(680px, parent.width - 48px);
+            height: Math.min(580px, parent.height - 48px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #2a1f18;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #4a3626;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+
+                Text {
+                    text: "Importar juego";
+                    color: #f2e6d4;
+                    font-size: 20px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.import-folder;
+                    color: #8a7662;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+                Text {
+                    text: "Nombre del juego";
+                    color: #b9a58e;
+                    font-size: 12px;
+                }
+                LineEdit {
+                    text <=> root.import-name;
+                    placeholder-text: "Nombre del juego";
+                }
+                Text {
+                    text: root.exe-candidates.length == 0 ? "No se encontraron ejecutables en esta carpeta. Puedes buscar uno manualmente." : "Ejecutable para iniciar el juego";
+                    color: #b9a58e;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for exe[i] in root.exe-candidates : Rectangle {
+                        height: 46px;
+                        border-radius: 6px;
+                        background: root.selected-exe == i ? #4a3626 : (exe-area.has-hover ? #36281d : transparent);
+
+                        exe-area := TouchArea {
+                            clicked => { root.selected-exe = i; }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 10px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                Text {
+                                    text: exe.label;
+                                    color: #f2e6d4;
+                                    font-size: 13px;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: exe.detail;
+                                    color: #8a7662;
+                                    font-size: 11px;
+                                }
+                            }
+                            Text {
+                                text: exe.suggested ? "Sugerido" : "";
+                                color: #c98a3b;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+                Text {
+                    text: root.scan-note;
+                    visible: root.scan-note != "";
+                    color: #c98a3b;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: "Buscar otro ejecutable…";
+                        clicked => { root.browse-exe-clicked(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cancelar";
+                        clicked => { root.import-cancel(); }
+                    }
+                    Button {
+                        text: "Añadir a la biblioteca";
+                        primary: true;
+                        enabled: root.selected-exe >= 0 && root.import-name != "";
+                        clicked => { root.import-confirm(root.import-name, root.selected-exe); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Ficha del juego ----
+    if root.detail-visible : Rectangle {
+        background: #000000c0;
+
+        TouchArea { }
+
+        Rectangle {
+            width: Math.min(580px, parent.width - 48px);
+            height: Math.min(440px, parent.height - 48px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #2a1f18;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #4a3626;
+
+            VerticalLayout {
+                padding: 22px;
+                spacing: 8px;
+
+                Text {
+                    text: root.detail.title;
+                    color: #f2e6d4;
+                    font-size: 22px;
+                    font-weight: 700;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Origen: " + root.detail.source;
+                    color: #b9a58e;
+                    font-size: 13px;
+                }
+                Text {
+                    text: "Carpeta: " + root.detail.install-path;
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Inicio: " + root.detail.launch-target;
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Estado: " + root.detail.status;
+                    color: #c98a3b;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Rectangle { vertical-stretch: 1; }
+                if root.confirm-remove : Text {
+                    text: "Se quitará solo de la biblioteca de UGL. No se borra ningún archivo del juego.";
+                    color: #c98a3b;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: "Jugar";
+                        primary: true;
+                        clicked => { root.play-clicked(root.detail.id); }
+                    }
+                    Button {
+                        text: "Cambiar ejecutable…";
+                        enabled: root.detail.can-change-exe;
+                        clicked => { root.change-exe-clicked(root.detail.id); }
+                    }
+                    Button {
+                        text: "Cambiar carpeta…";
+                        enabled: root.detail.can-change-path;
+                        clicked => { root.change-path-clicked(root.detail.id); }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    if !root.confirm-remove : Button {
+                        text: "Quitar de la biblioteca";
+                        clicked => { root.confirm-remove = true; }
+                    }
+                    if root.confirm-remove : Button {
+                        text: "Sí, quitar";
+                        clicked => { root.remove-clicked(root.detail.id); }
+                    }
+                    if root.confirm-remove : Button {
+                        text: "Cancelar";
+                        clicked => { root.confirm-remove = false; }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cerrar";
+                        clicked => { root.detail-close(); }
+                    }
+                }
+            }
+        }
+    }
+}
