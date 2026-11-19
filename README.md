@@ -2,278 +2,393 @@
 
 **One library. All your games.**
 
-UGL (Universal Game Launcher) es un launcher de videojuegos de código abierto diseñado para reunir, organizar y ejecutar juegos de diferentes plataformas desde una sola biblioteca.
+UGL is an open-source desktop application designed to bring video games from different platforms, stores, emulators, and local installations into one unified library.
 
-El proyecto busca ofrecer una alternativa ligera, modular y personalizable que permita administrar juegos instalados localmente, independientemente de su procedencia.
+The goal is to create a universal game launcher where users can organize, manage, launch, and track their games without being restricted to a single storefront or ecosystem.
 
-Está desarrollado con Rust, Slint y SQLite, priorizando el almacenamiento local, la modularidad y la posibilidad de ampliar sus funciones progresivamente.
+Built with **Rust, Slint, and SQLite**, UGL prioritizes performance, modularity, local data ownership, and extensibility.
 
----
-
-# 1. Características generales
-
-- Biblioteca unificada de videojuegos.
-- Importación de juegos instalados localmente.
-- Compatibilidad con bibliotecas locales de Steam.
-- Importación de ejecutables individuales.
-- Ejecución de juegos desde UGL.
-- Sistema de logros por juego.
-- Seguimiento del progreso de logros.
-- Gestión local de información y configuraciones.
-- Caché de iconos e imágenes.
-- Actualización automática de información compatible.
-- Interfaz gráfica personalizable.
-
-**Importante:** UGL está enfocado en los juegos instalados localmente. No pretende limitarse a una tienda específica ni requiere que todos los juegos pertenezcan a una plataforma digital.
+> UGL is a launcher and library manager, not a digital game store. It does not distribute games, replace storefronts, or bypass platform DRM.
 
 ---
 
-# 2. Historial de versiones
+## Project vision
 
-## v0.0.1-alpha — First Experimental Build
+Most game launchers are tied to a particular store or ecosystem. UGL aims to provide a single place to manage games regardless of where they come from.
 
-<badge>Primera versión funcional</badge>
+The long-term vision is to support:
 
-La primera versión de UGL estableció los fundamentos del proyecto: una aplicación de escritorio capaz de crear una biblioteca local, registrar juegos y ejecutarlos desde una misma interfaz.
+- Steam and other digital storefronts.
+- Independently installed PC games.
+- DRM-free games.
+- Games installed from local folders or external drives.
+- Emulators and retro game libraries.
+- Achievement systems from different platforms and emulators.
+- Custom games and user-defined entries.
 
-### Funcionalidades
+UGL should be useful both to players with several digital storefronts and to players who manage their games manually.
 
-- Estructura inicial del proyecto en Rust.
-- Interfaz gráfica desarrollada con Slint.
-- Base de datos SQLite para almacenar información.
-- Biblioteca de juegos instalados localmente.
-- Importación de juegos mediante carpetas.
-- Importación de bibliotecas locales de Steam.
-- Detección de juegos instalados.
-- Registro de información de los juegos.
-- Ejecución de juegos desde UGL.
-- Persistencia de la biblioteca entre sesiones.
+The launcher should not require every game to belong to an online account. A local executable should be enough to add and launch a compatible game.
 
-### Limitaciones
+### Core principles
 
-- Interfaz todavía básica.
-- Sin sistema de logros.
-- Sin integración con la biblioteca online de Steam.
-- Sin recuperación avanzada de metadatos.
-- Sin diseño visual definitivo.
-- Funcionalidades todavía experimentales.
+**1. Universal library**
 
-**Objetivo de esta versión:** demostrar que era posible reunir juegos instalados de diferentes procedencias y ejecutarlos desde una única aplicación.
+Games from different sources should coexist in the same library, with their origin and platform identified.
 
----
+**2. Local-first architecture**
 
-## v0.0.2-alpha — Achievement System
+Game information, library entries, settings, achievement records, and cached images should be stored locally whenever possible.
 
-<badge color="success">Sistema de logros</badge>
+**3. Platform independence**
 
-La segunda versión amplió las capacidades de UGL mediante la incorporación de un sistema de logros integrado en la biblioteca.
+UGL should not depend entirely on one storefront. Platform-specific integrations should be modular and optional.
 
-Cada juego compatible puede contar con su propia ventana de logros, permitiendo consultar el progreso y distinguir entre logros desbloqueados y pendientes.
+**4. Lightweight performance**
 
-### Funcionalidades
+Background tasks should avoid blocking the interface or consuming unnecessary CPU and memory.
 
-**Sistema de logros**
-- Ventana independiente de logros para cada juego.
-- Visualización del nombre y descripción de cada logro.
-- Distinción entre logros desbloqueados y bloqueados.
-- Registro de fecha y hora de desbloqueo.
-- Porcentaje de progreso por juego.
-- Contador de logros desbloqueados respecto al total.
+**5. User control**
 
-**Filtros**
-- Todos.
-- Desbloqueados.
-- Bloqueados.
+Users should be able to manage game entries, executable paths, launch methods, metadata, and library organization.
 
-**Interfaz**
-- Acceso a los logros desde la biblioteca.
-- Indicador del progreso de logros junto al juego.
-- Barra de progreso y porcentaje de finalización.
-- Ventana de información y gestión de cada juego.
-- Botón para actualizar manualmente la información de logros.
+**6. Extensibility**
 
-**Almacenamiento**
-- Persistencia local de la información mediante SQLite.
-- Conservación del progreso registrado entre sesiones.
-
-### Limitaciones
-
-- La actualización de los logros todavía era manual.
-- Las imágenes de los logros no contaban con su integración definitiva.
-- No existía actualización automática completa.
-- No había notificaciones de desbloqueo.
-- La integración con las fuentes de logros todavía estaba en desarrollo.
-
-**Objetivo de esta versión:** convertir UGL en algo más que un simple lanzador, incorporando una biblioteca que también permita consultar y seguir los logros de los juegos.
+New storefronts, emulators, achievement providers, and library sources should be addable without rewriting the entire application.
 
 ---
 
-## v0.0.3-alpha — Automation & Library Improvements
+## Current development status
 
-<badge color="success">Automatización y mejoras</badge>
+<badge color="success">Experimental Alpha</badge>
 
-La tercera versión se centró en reducir las tareas manuales y mejorar la presentación de los juegos y sus logros.
+UGL is under active development. Its first development target is Windows.
 
-Se incorporaron mejoras en la extracción de iconos, la actualización automática de información y la utilización de imágenes de logros de Steam.
+The current project focuses on locally installed games and the foundations required for a unified library.
 
-### Funcionalidades
+### Current capabilities
 
-**Iconos de juegos**
-- Extracción automática de iconos desde los ejecutables.
-- Visualización del icono correspondiente antes del nombre del juego.
-- Uso de iconos provisionales cuando no se encuentra uno adecuado.
-- Mejoras en la gestión y conservación de los iconos.
+- Local game library.
+- Manual game import through folders.
+- Steam library discovery through local Steam files.
+- Game registration and persistent storage using SQLite.
+- Game launching through executables or Steam URI.
+- Duplicate prevention using source identifiers.
+- Game search and sorting.
+- Per-game achievement records.
+- Local Steam achievement data reader.
+- Achievement progress and unlock timestamps.
+- Achievement icon and image caching.
+- Executable icon extraction on Windows.
+- Automatic monitoring of selected Steam library files.
+- Local settings and diagnostic logs.
 
-**Actualización automática**
-- Actualización periódica de las bibliotecas locales de Steam.
-- Detección de nuevos juegos instalados en las bibliotecas supervisadas.
-- Actualización automática de la información de logros.
-- Reducción de la necesidad de utilizar manualmente el botón de actualización.
-- Opciones de configuración para desactivar las actualizaciones automáticas.
+Some integrations depend on the game, platform, and availability of local data. See the technical documentation for implementation details and limitations.
 
-**Imágenes de logros**
-- Incorporación de imágenes de logros procedentes de Steam.
-- Visualización de la variante a color para los logros desbloqueados.
-- Visualización de la variante en escala de grises para los logros bloqueados.
-- Descarga opcional de las imágenes para conservarlas localmente.
+### Development scope
 
-**Funcionamiento offline**
-- Conservación local de la información disponible.
-- Reutilización de imágenes almacenadas en caché.
-- Las funciones principales de biblioteca y lanzamiento no dependen de una conexión permanente a Internet.
-- La descarga de imágenes de logros de Steam requiere conexión a Internet.
+The current priority is to improve the management of games already installed on the computer.
 
-**Objetivo de esta versión:** automatizar tareas que anteriormente requerían intervención manual y mejorar la experiencia visual de la biblioteca y el sistema de logros.
+The following are future goals, not guaranteed current features:
+
+- Importing owned but uninstalled games from online accounts.
+- Full synchronization with multiple storefront accounts.
+- A universal achievement synchronization service.
+- Editing official platform achievements.
+- Cross-platform builds beyond the initial Windows target.
+- Advanced playtime tracking and session history.
+- The complete physical-game-shelf interface.
 
 ---
 
-# 3. Tecnologías utilizadas
+## Interface and design direction
 
-| Tecnología | Función |
+UGL is intended to use a customizable skeuomorphic interface inspired by physical video game collections.
+
+The visual direction includes:
+
+- Modern games represented by physical-style DVD or Blu-ray cases.
+- Retro games represented by cartridges.
+- Game artwork, icons, and platform identification.
+- Game details presented as a physical game package.
+- Achievement screens inspired by console achievement interfaces, particularly Xbox 360.
+- A consistent visual identity across the library and game details.
+
+The current interface is an evolving implementation. The final visual design is still part of the roadmap.
+
+---
+
+## Architecture
+
+UGL is organized as a Rust workspace with two main crates:
+
+```text
+Universal-Game-Launcher/
+│
+├── crates/
+│   ├── ugl-core/
+│   │   └── Core application logic
+│   │
+│   └── ugl-app/
+│       └── Desktop application and UI
+│
+├── .github/
+│   └── workflows/
+│
+├── Cargo.toml
+├── Cargo.lock
+├── README.md
+├── LICENSE
+└── .gitignore
+```
+
+### `ugl-core`
+
+Contains the application logic independently from the graphical interface.
+
+Responsibilities include:
+
+- Game library management.
+- Database access and migrations.
+- Game discovery and registration.
+- Platform integrations.
+- Achievement management.
+- Icon extraction and caching.
+- Process launching.
+- Settings and diagnostics.
+- Filesystem monitoring.
+
+The core exposes a `Core` application interface. The graphical application should communicate with this interface instead of accessing SQLite or platform integrations directly.
+
+### `ugl-app`
+
+Contains the desktop application.
+
+Responsibilities include:
+
+- Main window.
+- Slint user interface.
+- User interactions.
+- File and folder selection.
+- Displaying the game library.
+- Displaying game information and achievements.
+- Communicating with `ugl-core`.
+
+The UI should not implement platform-specific business logic directly.
+
+---
+
+## Technology stack and dependencies
+
+| Technology / crate | Purpose |
 |---|---|
-| Rust | Lenguaje principal |
-| Slint | Interfaz gráfica |
-| SQLite | Base de datos local |
-| Cargo | Gestión de dependencias y compilación |
-| Windows API | Funciones específicas del sistema operativo |
+| Rust | Main programming language |
+| Slint | Desktop graphical interface |
+| SQLite | Persistent local database |
+| `rusqlite` | Rust interface to SQLite |
+| `thiserror` | Structured error definitions |
+| `dirs` | Resolving user data directories |
+| `notify` | Filesystem event monitoring |
+| `rfd` | Native file and folder dialogs |
+| `slint-build` | Compiling Slint UI resources |
+| `winresource` | Windows executable resources and icon |
+| `tempfile` | Temporary directories in tests |
 
-### Arquitectura
+The project also uses Rust standard library functionality for filesystem operations, process management, threading, synchronization, and Windows-specific API calls.
 
-UGL utiliza una arquitectura modular organizada en dos componentes principales:
+See `Cargo.toml` and `Cargo.lock` for the exact dependency declarations and resolved versions.
 
-- **ugl-core:** lógica principal, biblioteca, base de datos, integraciones y gestión de procesos.
-- **ugl-app:** aplicación de escritorio e interfaz gráfica desarrollada con Slint.
+### Why these technologies?
 
-La interfaz se comunica con el núcleo de la aplicación, evitando concentrar toda la lógica del programa en los componentes visuales.
+**Rust**
 
----
+Provides memory safety, predictable performance, and a suitable foundation for a desktop application that interacts with the filesystem and external processes.
 
-# 4. Almacenamiento local
+**Slint**
 
-UGL utiliza SQLite para conservar los datos de la aplicación.
+Provides a declarative UI system designed for lightweight native applications.
 
-En Windows, los datos se almacenan normalmente en:
+**SQLite**
 
-`%LOCALAPPDATA%\UGL`
+Keeps the library and application data in a local database without requiring a separate database server.
 
-Dentro de esta ubicación se encuentran:
+**notify**
 
-- `ugl.db`: base de datos.
-- `logs\`: registros de ejecución.
-- `cache\`: archivos almacenados en caché.
-
-También se contempla la posibilidad de establecer una ubicación personalizada mediante la variable de entorno `UGL_DATA_DIR`.
-
-Los datos de la biblioteca se gestionan independientemente de los archivos originales de los videojuegos.
-
-**Quitar un juego de la biblioteca no elimina su instalación ni sus archivos originales.**
+Allows UGL to react to filesystem changes instead of continuously scanning monitored directories.
 
 ---
 
-# 5. Alcance actual del proyecto
+## Local data storage
 
-UGL se encuentra en una etapa experimental Alpha.
+UGL stores user data independently from the directory where the executable is launched.
 
-El desarrollo se centra inicialmente en Windows y en la administración de juegos instalados localmente.
+Default Windows location:
 
-### Lo que busca ofrecer
+```text
+%LOCALAPPDATA%\UGL\
+│
+├── ugl.db
+│
+├── logs/
+│   └── ugl.log
+│
+└── cache/
+    ├── icons/
+    └── achievements/
+```
 
-- Una biblioteca única para juegos de diferentes procedencias.
-- Administración local de videojuegos.
-- Lanzamiento desde una misma aplicación.
-- Seguimiento de logros.
-- Almacenamiento local y funcionamiento offline cuando sea posible.
-- Una arquitectura preparada para futuras integraciones.
+The database stores structured information such as:
 
-### Lo que todavía no representa
+- Games.
+- Platforms.
+- Installations.
+- Game sources.
+- Settings.
+- Achievements.
+- Unlock states.
 
-- Una tienda digital.
-- Un servicio de descarga de videojuegos.
-- Un sustituto de Steam, Epic Games u otras plataformas.
-- Una sincronización universal de cuentas online.
-- Una garantía de compatibilidad con todos los juegos y emuladores.
+The cache stores images and other generated or downloaded resources.
 
----
-
-# 6. Hoja de ruta futura
-
-UGL continuará desarrollándose por etapas.
-
-Entre los objetivos futuros se encuentran:
-
-- Mejorar la compatibilidad con diferentes launchers.
-- Ampliar la detección y gestión de instalaciones.
-- Mejorar la importación de múltiples ejecutables.
-- Perfeccionar la gestión de metadatos e imágenes.
-- Ampliar las fuentes compatibles con el sistema de logros.
-- Mejorar el seguimiento de tiempo de juego.
-- Incorporar nuevas opciones de personalización.
-- Desarrollar una interfaz inspirada en las bibliotecas físicas de videojuegos.
-
-Estas funcionalidades forman parte de los objetivos de desarrollo y no deben considerarse implementadas hasta que aparezcan en una versión publicada.
-
----
-
-# 7. Compilación del proyecto
-
-Requisitos:
-
-- Rust estable.
-- Cargo.
-- Herramientas de compilación de C++ de Visual Studio en Windows.
-
-Comandos principales:
+A custom data directory can be configured with:
 
 ```powershell
-# Comprobar el proyecto
+$env:UGL_DATA_DIR = "D:\UGL-Data"
+```
+
+This is useful for development, testing, or portable setups.
+
+Removing a game from the UGL library does not delete its original installation files.
+
+---
+
+## Building from source
+
+### Requirements
+
+- Windows 10 or later.
+- Rust stable.
+- Cargo.
+- Visual Studio C++ Build Tools.
+- Git.
+
+Install Rust through:
+
+https://rustup.rs/
+
+### Clone the repository
+
+```powershell
+git clone https://github.com/maes773/Universal-Game-Launcher.git
+cd Universal-Game-Launcher
+```
+
+### Check the workspace
+
+```powershell
 cargo check --workspace
+```
 
-# Ejecutar las pruebas
+### Run tests
+
+```powershell
 cargo test --workspace
+```
 
-# Ejecutar UGL en desarrollo
+### Run the application
+
+```powershell
 cargo run -p ugl-app
+```
 
-# Generar la versión optimizada
+### Build the release executable
+
+```powershell
 cargo build --release -p ugl-app
 ```
 
-El ejecutable generado se encuentra normalmente en:
+The executable is generated at:
 
-`target/release/ugl.exe`
+```text
+target/release/ugl.exe
+```
+
+The exact output can depend on the binary target defined in `crates/ugl-app/Cargo.toml`.
 
 ---
 
-# 8. Licencia y contribuciones
+## Development guidelines
 
-UGL es un proyecto de código abierto publicado bajo la licencia MIT.
+Contributions should follow the existing architecture.
 
-El proyecto busca crecer progresivamente mediante mejoras, correcciones y nuevas integraciones.
+- Keep platform integrations inside `ugl-core`.
+- Keep UI code inside `ugl-app`.
+- Avoid direct database access from Slint components.
+- Use database migrations for schema changes.
+- Preserve existing user data.
+- Avoid blocking the UI thread with filesystem or network operations.
+- Handle missing files and inaccessible directories gracefully.
+- Keep optional integrations independent.
+- Add tests for new core functionality.
+- Update the technical documentation when adding a new module or dependency.
 
-Repositorio oficial:
+### Recommended validation
+
+```powershell
+cargo fmt --all -- --check
+cargo check --workspace
+cargo test --workspace
+cargo build --release
+```
+
+---
+
+## Roadmap
+
+UGL is being developed incrementally.
+
+### Library foundation
+- [x] Rust workspace.
+- [x] Slint desktop interface.
+- [x] SQLite persistence.
+- [x] Manual game import.
+- [x] Local Steam library discovery.
+- [x] Basic game launching.
+
+### Achievement system
+- [x] Achievement database.
+- [x] Per-game achievement display.
+- [x] Unlock status and timestamps.
+- [x] Local achievement data reader.
+- [x] Achievement image caching.
+
+### Library improvements
+- [x] Executable icon extraction.
+- [x] Steam library monitoring.
+- [ ] More flexible launch configuration.
+- [ ] Advanced multi-executable import.
+- [ ] Better detection of moved installations.
+- [ ] More storefront and emulator integrations.
+
+### Long-term goals
+- [ ] Unified achievement providers.
+- [ ] Playtime tracking.
+- [ ] More extensive metadata integrations.
+- [ ] Background tray operation.
+- [ ] Skeuomorphic physical-library interface.
+- [ ] Additional operating system support.
+
+Checkboxes describe the implementation status of the public development snapshot and should be updated as the project evolves.
+
+---
+
+## License
+
+UGL is distributed under the MIT License.
+
+See [LICENSE](LICENSE) for details.
+
+## Repository
 
 https://github.com/maes773/Universal-Game-Launcher
-
----
 
 **UGL — One library. All your games.**
