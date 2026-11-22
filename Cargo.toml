@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/ugl-core", "crates/ugl-app"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.0.4"
 edition = "2021"
 
 [workspace.dependencies]

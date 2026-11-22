@@ -26,6 +26,8 @@ pub struct IconJob {
     pub install_path: PathBuf,
     pub launch_kind: LaunchKind,
     pub launch_target: String,
+    /// Ejecutable directo conocido (aunque el juego se inicie por Steam).
+    pub exe_path: Option<String>,
 }
 
 pub fn icon_file(cache_dir: &Path, game_id: GameId) -> PathBuf {
@@ -35,17 +37,27 @@ pub fn icon_file(cache_dir: &Path, game_id: GameId) -> PathBuf {
 /// Ejecutable cuyo icono representa al juego. Los juegos propios usan el que el usuario eligió;
 /// los de Steam, el mejor candidato de su carpeta (solo si hay una propuesta razonable).
 pub fn icon_source_exe(job: &IconJob) -> Option<PathBuf> {
-    match job.launch_kind {
-        LaunchKind::Executable => {
-            let exe = job.install_path.join(&job.launch_target);
-            exe.is_file().then_some(exe)
+    // 1) El ejecutable que ya se conoce (el elegido por el usuario o el de la importación).
+    let known = match job.launch_kind {
+        LaunchKind::Executable => Some(job.launch_target.as_str()),
+        _ => job.exe_path.as_deref(),
+    };
+    if let Some(relative) = known.filter(|path| !path.is_empty()) {
+        let exe = job.install_path.join(relative);
+        if exe.is_file() {
+            return Some(exe);
         }
-        LaunchKind::SteamUri => {
-            let scan = manual::scan_game_folder(&job.install_path).ok()?;
-            let best = scan.candidates.first().filter(|c| c.suggested)?;
-            Some(job.install_path.join(&best.relative))
+        if job.launch_kind == LaunchKind::Executable {
+            return None;
         }
     }
+    // 2) Juego de Steam sin ejecutable conocido: el mejor candidato de su carpeta.
+    if job.launch_kind == LaunchKind::SteamUri {
+        let scan = manual::scan_game_folder(&job.install_path).ok()?;
+        let best = scan.candidates.first().filter(|c| c.suggested)?;
+        return Some(job.install_path.join(&best.relative));
+    }
+    None
 }
 
 /// Extrae el icono y lo guarda en la caché. `Ok(None)` = el juego no tiene ejecutable del que
@@ -340,6 +352,7 @@ mod tests {
             install_path: dir.to_path_buf(),
             launch_kind: kind,
             launch_target: target.to_string(),
+            exe_path: None,
         }
     }
 
@@ -364,6 +377,19 @@ mod tests {
 
         let found = icon_source_exe(&job(&dir, LaunchKind::SteamUri, "220"));
         assert_eq!(found, Some(dir.join("hl2.exe")));
+    }
+
+    #[test]
+    fn a_known_executable_wins_over_the_steam_heuristic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("Juego");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("juego.exe"), b"MZ").unwrap();
+        fs::write(dir.join("otro.exe"), b"MZ").unwrap();
+
+        let mut steam_job = job(&dir, LaunchKind::SteamUri, "1");
+        steam_job.exe_path = Some("otro.exe".to_string());
+        assert_eq!(icon_source_exe(&steam_job), Some(dir.join("otro.exe")));
     }
 
     #[test]

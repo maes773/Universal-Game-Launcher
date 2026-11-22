@@ -3,7 +3,8 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::domain::{
-    unix_now, DiscoveredGame, Game, GameId, LaunchKind, RegisterSummary, SortOrder,
+    unix_now, DiscoveredGame, Game, GameId, LaunchKind, MetadataRecord, OwnedGame, RegisterSummary,
+    SortOrder,
 };
 use crate::error::{Result, UglError};
 
@@ -20,7 +21,11 @@ SELECT g.id,
        (SELECT COUNT(*) FROM achievements WHERE game_id = g.id),
        (SELECT COUNT(*) FROM achievements a JOIN unlocks u ON u.achievement_id = a.id
          WHERE a.game_id = g.id AND u.unlocked = 1),
-       g.icon_path
+       g.icon_path,
+       i.exe_path,
+       i.launch_args,
+       i.working_dir,
+       i.steam_app_id
 FROM games g
 JOIN platforms p ON p.id = g.platform_id
 JOIN installations i ON i.id = (
@@ -51,6 +56,10 @@ fn map_game(row: &Row<'_>) -> rusqlite::Result<Game> {
         achievements_total: row.get::<_, i64>(9)? as u32,
         achievements_unlocked: row.get::<_, i64>(10)? as u32,
         icon_path: row.get(11)?,
+        exe_path: row.get(12)?,
+        launch_args: row.get(13)?,
+        working_dir: row.get(14)?,
+        steam_app_id: row.get::<_, Option<i64>>(15)?.map(|id| id as u64),
     })
 }
 
@@ -141,13 +150,18 @@ pub fn register(conn: &mut Connection, games: &[DiscoveredGame]) -> Result<Regis
 
                 tx.execute(
                     "INSERT INTO installations
-                         (game_id, install_path, launch_kind, launch_target, is_primary, created_at)
-                     VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+                         (game_id, install_path, launch_kind, launch_target, exe_path,
+                          launch_args, working_dir, steam_app_id, is_primary, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)",
                     params![
                         game_id,
                         install_path,
                         game.launch_kind.as_str(),
                         game.launch_target,
+                        game.exe_path,
+                        game.launch_args,
+                        game.working_dir,
+                        game.steam_app_id.map(|id| id as i64),
                         now
                     ],
                 )?;
@@ -174,7 +188,7 @@ pub fn touch_last_played(conn: &Connection, id: GameId) -> Result<()> {
 
 pub fn set_executable(conn: &Connection, id: GameId, relative_path: &str) -> Result<()> {
     let changed = conn.execute(
-        "UPDATE installations SET launch_target = ?1
+        "UPDATE installations SET launch_target = ?1, exe_path = ?1
          WHERE game_id = ?2 AND is_primary = 1 AND launch_kind = 'executable'",
         params![relative_path, id],
     )?;
@@ -195,6 +209,238 @@ pub fn set_install_path(conn: &Connection, id: GameId, path: &str) -> Result<()>
     if changed == 0 {
         return Err(UglError::NotFound(format!(
             "la instalación manual del juego {id}"
+        )));
+    }
+    Ok(())
+}
+
+fn join_list(items: &[String]) -> String {
+    items.join("\n")
+}
+
+fn split_list(text: Option<String>) -> Vec<String> {
+    text.unwrap_or_default()
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Guarda (o reemplaza) la ficha de la tienda de un juego.
+pub fn save_metadata(conn: &Connection, game_id: GameId, record: &MetadataRecord) -> Result<()> {
+    conn.execute(
+        "INSERT INTO game_metadata
+             (game_id, steam_app_id, status, name, short_description, developers, publishers,
+              genres, release_date, website, cover_path, language, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'spanish', ?12)
+         ON CONFLICT(game_id) DO UPDATE SET
+             steam_app_id = excluded.steam_app_id, status = excluded.status, name = excluded.name,
+             short_description = excluded.short_description, developers = excluded.developers,
+             publishers = excluded.publishers, genres = excluded.genres,
+             release_date = excluded.release_date, website = excluded.website,
+             cover_path = excluded.cover_path, fetched_at = excluded.fetched_at",
+        params![
+            game_id,
+            record.steam_app_id as i64,
+            if record.available { "ok" } else { "unavailable" },
+            record.name,
+            record.short_description,
+            join_list(&record.developers),
+            join_list(&record.publishers),
+            join_list(&record.genres),
+            record.release_date,
+            record.website,
+            record.cover_path,
+            unix_now()
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn get_metadata(conn: &Connection, game_id: GameId) -> Result<Option<MetadataRecord>> {
+    let found = conn
+        .query_row(
+            "SELECT steam_app_id, status, name, short_description, developers, publishers,
+                    genres, release_date, website, cover_path
+             FROM game_metadata WHERE game_id = ?1",
+            params![game_id],
+            |row| {
+                Ok(MetadataRecord {
+                    steam_app_id: row.get::<_, i64>(0)? as u64,
+                    available: row.get::<_, String>(1)? == "ok",
+                    name: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    short_description: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    developers: split_list(row.get(4)?),
+                    publishers: split_list(row.get(5)?),
+                    genres: split_list(row.get(6)?),
+                    release_date: row.get::<_, Option<String>>(7)?.unwrap_or_default(),
+                    website: row.get(8)?,
+                    cover_path: row.get(9)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(found)
+}
+
+pub fn delete_metadata(conn: &Connection, game_id: GameId) -> Result<()> {
+    conn.execute("DELETE FROM game_metadata WHERE game_id = ?1", params![game_id])?;
+    Ok(())
+}
+
+/// Juegos con AppID conocido cuya ficha aún no está guardada (o es de otro AppID).
+pub fn games_needing_metadata(conn: &Connection, limit: usize) -> Result<Vec<(GameId, u64)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT i.game_id, i.steam_app_id
+         FROM installations i
+         JOIN games g ON g.id = i.game_id
+         LEFT JOIN game_metadata m ON m.game_id = i.game_id AND m.steam_app_id = i.steam_app_id
+         WHERE i.is_primary = 1 AND i.steam_app_id IS NOT NULL AND g.hidden = 0 AND m.game_id IS NULL
+         ORDER BY i.game_id
+         LIMIT ?1",
+    )?;
+    let rows = stmt.query_map(params![limit as i64], |row| {
+        Ok((row.get::<_, GameId>(0)?, row.get::<_, i64>(1)? as u64))
+    })?;
+    let jobs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(jobs)
+}
+
+/// Asocia (o desasocia) un juego con una ficha de Steam sin cambiar su método de inicio.
+pub fn set_steam_app_id(conn: &Connection, id: GameId, app_id: Option<u64>) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE installations SET steam_app_id = ?1 WHERE game_id = ?2 AND is_primary = 1",
+        params![app_id.map(|v| v as i64), id],
+    )?;
+    if changed == 0 {
+        return Err(UglError::NotFound(format!("el juego {id}")));
+    }
+    Ok(())
+}
+
+pub fn find_game_by_steam_app_id(conn: &Connection, app_id: u64) -> Result<Option<GameId>> {
+    let found = conn
+        .query_row(
+            "SELECT game_id FROM installations
+             WHERE steam_app_id = ?1 AND is_primary = 1 ORDER BY game_id LIMIT 1",
+            params![app_id as i64],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found)
+}
+
+pub fn rename_game(conn: &Connection, id: GameId, title: &str) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE games SET title = ?1, sort_title = ?2 WHERE id = ?3",
+        params![title, title.to_lowercase(), id],
+    )?;
+    if changed == 0 {
+        return Err(UglError::NotFound(format!("el juego {id}")));
+    }
+    Ok(())
+}
+
+/// Condición SQL: el juego de la cuenta (alias `a`) no está en la biblioteca local.
+const OWNED_ONLY: &str = "NOT EXISTS (SELECT 1 FROM installations i WHERE i.steam_app_id = a.app_id AND i.is_primary = 1)
+     AND NOT EXISTS (SELECT 1 FROM game_sources s WHERE s.provider = 'steam' AND s.external_id = CAST(a.app_id AS TEXT))";
+
+/// Sustituye la copia local de la biblioteca de la cuenta por la que devuelve Steam.
+pub fn replace_account_games(conn: &mut Connection, games: &[OwnedGame]) -> Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM account_games", params![])?;
+    let now = unix_now();
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO account_games
+                 (app_id, name, playtime_minutes, last_played_at, synced_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
+        for game in games {
+            stmt.execute(params![
+                game.app_id as i64,
+                game.name,
+                game.playtime_minutes as i64,
+                game.last_played_at,
+                now
+            ])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+pub fn clear_account_games(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM account_games", params![])?;
+    Ok(())
+}
+
+/// Juegos de la cuenta que no están en la biblioteca local (los «no instalados»).
+pub fn list_owned_only(conn: &Connection, query: &str, order: SortOrder) -> Result<Vec<OwnedGame>> {
+    let order_by = match order {
+        SortOrder::RecentlyPlayed => "a.last_played_at IS NULL, a.last_played_at DESC, lower(a.name) ASC",
+        _ => "lower(a.name) ASC",
+    };
+    let sql = format!(
+        "SELECT a.app_id, a.name, a.playtime_minutes, a.last_played_at
+         FROM account_games a
+         WHERE a.name LIKE ?1 ESCAPE '\\' AND {OWNED_ONLY}
+         ORDER BY {order_by}"
+    );
+    let pattern = format!("%{}%", escape_like(query.trim()));
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(params![pattern], |row| {
+        Ok(OwnedGame {
+            app_id: row.get::<_, i64>(0)? as u64,
+            name: row.get(1)?,
+            playtime_minutes: row.get::<_, i64>(2)? as u64,
+            last_played_at: row.get(3)?,
+        })
+    })?;
+    let games = rows.collect::<rusqlite::Result<Vec<OwnedGame>>>()?;
+    Ok(games)
+}
+
+/// (total en la cuenta, de ellos sin instalar).
+pub fn count_account_games(conn: &Connection) -> Result<(usize, usize)> {
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM account_games", params![], |r| r.get(0))?;
+    let not_installed: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM account_games a WHERE {OWNED_ONLY}"),
+        params![],
+        |r| r.get(0),
+    )?;
+    Ok((total as usize, not_installed as usize))
+}
+
+/// Método de lanzamiento completo de un juego (lo valida `Core::update_launch`).
+pub struct LaunchRow<'a> {
+    pub kind: LaunchKind,
+    pub target: &'a str,
+    pub exe_path: Option<&'a str>,
+    pub args: &'a str,
+    pub working_dir: Option<&'a str>,
+    pub steam_app_id: Option<u64>,
+}
+
+pub fn update_launch(conn: &Connection, id: GameId, row: &LaunchRow<'_>) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE installations
+         SET launch_kind = ?1, launch_target = ?2, exe_path = ?3,
+             launch_args = ?4, working_dir = ?5, steam_app_id = ?6
+         WHERE game_id = ?7 AND is_primary = 1",
+        params![
+            row.kind.as_str(),
+            row.target,
+            row.exe_path,
+            row.args,
+            row.working_dir,
+            row.steam_app_id.map(|app_id| app_id as i64),
+            id
+        ],
+    )?;
+    if changed == 0 {
+        return Err(UglError::NotFound(format!(
+            "la instalación principal del juego {id}"
         )));
     }
     Ok(())
@@ -265,6 +511,8 @@ mod tests {
             install_path: PathBuf::from(path),
             launch_kind: LaunchKind::SteamUri,
             launch_target: app_id.to_string(),
+            steam_app_id: Some(app_id),
+            ..Default::default()
         }
     }
 
@@ -360,6 +608,103 @@ mod tests {
         register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
         assert!(find_game_by_source(db.conn(), "steam", "220").unwrap().is_some());
         assert!(find_game_by_source(db.conn(), "steam", "999").unwrap().is_none());
+    }
+
+    fn sample_record(app_id: u64) -> MetadataRecord {
+        MetadataRecord {
+            steam_app_id: app_id,
+            available: true,
+            name: "Half-Life 2".into(),
+            short_description: "Descripción".into(),
+            developers: vec!["Valve".into()],
+            publishers: vec!["Valve".into(), "Otro".into()],
+            genres: vec!["Acción".into()],
+            release_date: "16 NOV 2004".into(),
+            website: Some("http://x".into()),
+            cover_path: Some("c.jpg".into()),
+        }
+    }
+
+    #[test]
+    fn metadata_roundtrip_and_pending_jobs() {
+        let mut db = Database::open_in_memory().unwrap();
+        register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
+        let id = list_games(db.conn(), "", SortOrder::Title).unwrap()[0].id;
+
+        assert_eq!(games_needing_metadata(db.conn(), 10).unwrap(), vec![(id, 220)]);
+        save_metadata(db.conn(), id, &sample_record(220)).unwrap();
+        assert!(games_needing_metadata(db.conn(), 10).unwrap().is_empty());
+        assert_eq!(get_metadata(db.conn(), id).unwrap(), Some(sample_record(220)));
+
+        // Cambiar la asociación manualmente obliga a pedir la ficha nueva.
+        set_steam_app_id(db.conn(), id, Some(70)).unwrap();
+        assert_eq!(games_needing_metadata(db.conn(), 10).unwrap(), vec![(id, 70)]);
+        delete_metadata(db.conn(), id).unwrap();
+        assert!(get_metadata(db.conn(), id).unwrap().is_none());
+    }
+
+    #[test]
+    fn unavailable_pages_are_remembered_and_games_can_be_found_by_app_id() {
+        let mut db = Database::open_in_memory().unwrap();
+        register(db.conn_mut(), &[steam_game(5, "X", "C:\\a")]).unwrap();
+        let id = list_games(db.conn(), "", SortOrder::Title).unwrap()[0].id;
+        let record = MetadataRecord { steam_app_id: 5, available: false, ..Default::default() };
+        save_metadata(db.conn(), id, &record).unwrap();
+        assert!(games_needing_metadata(db.conn(), 10).unwrap().is_empty());
+        assert!(!get_metadata(db.conn(), id).unwrap().unwrap().available);
+        assert_eq!(find_game_by_steam_app_id(db.conn(), 5).unwrap(), Some(id));
+        assert_eq!(find_game_by_steam_app_id(db.conn(), 6).unwrap(), None);
+    }
+
+    #[test]
+    fn renaming_keeps_the_sort_title_in_sync() {
+        let mut db = Database::open_in_memory().unwrap();
+        register(db.conn_mut(), &[steam_game(1, "zzz", "C:\\a"), steam_game(2, "mmm", "C:\\b")]).unwrap();
+        let id = list_games(db.conn(), "zzz", SortOrder::Title).unwrap()[0].id;
+        rename_game(db.conn(), id, "Aaa Nuevo").unwrap();
+        let first = list_games(db.conn(), "", SortOrder::Title).unwrap();
+        assert_eq!(first[0].title, "Aaa Nuevo");
+    }
+
+    fn owned(app_id: u64, name: &str, minutes: u64, last: Option<i64>) -> OwnedGame {
+        OwnedGame { app_id, name: name.into(), playtime_minutes: minutes, last_played_at: last }
+    }
+
+    #[test]
+    fn account_games_hide_what_is_already_in_the_library() {
+        let mut db = Database::open_in_memory().unwrap();
+        replace_account_games(
+            db.conn_mut(),
+            &[owned(220, "Half-Life 2", 120, Some(100)), owned(440, "Team Fortress 2", 5, None), owned(10, "Counter-Strike", 0, Some(50))],
+        )
+        .unwrap();
+        assert_eq!(count_account_games(db.conn()).unwrap(), (3, 3));
+
+        // Half-Life 2 se instala (aparece en la biblioteca): deja de ser «no instalado».
+        register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
+        let names: Vec<String> = list_owned_only(db.conn(), "", SortOrder::Title)
+            .unwrap()
+            .into_iter()
+            .map(|g| g.name)
+            .collect();
+        assert_eq!(names, vec!["Counter-Strike", "Team Fortress 2"]);
+        assert_eq!(count_account_games(db.conn()).unwrap(), (3, 2));
+
+        // Búsqueda y orden por última partida.
+        assert_eq!(list_owned_only(db.conn(), "team", SortOrder::Title).unwrap().len(), 1);
+        let recent = list_owned_only(db.conn(), "", SortOrder::RecentlyPlayed).unwrap();
+        assert_eq!(recent[0].name, "Counter-Strike");
+        assert_eq!(recent[1].name, "Team Fortress 2"); // sin fecha, al final
+    }
+
+    #[test]
+    fn replacing_the_account_library_discards_the_old_copy() {
+        let mut db = Database::open_in_memory().unwrap();
+        replace_account_games(db.conn_mut(), &[owned(1, "A", 0, None), owned(2, "B", 0, None)]).unwrap();
+        replace_account_games(db.conn_mut(), &[owned(3, "C", 0, None)]).unwrap();
+        assert_eq!(count_account_games(db.conn()).unwrap(), (1, 1));
+        clear_account_games(db.conn()).unwrap();
+        assert_eq!(count_account_games(db.conn()).unwrap(), (0, 0));
     }
 
     #[test]

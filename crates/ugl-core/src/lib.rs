@@ -11,11 +11,14 @@ pub mod domain;
 pub mod error;
 pub mod icons;
 pub mod integrations;
+pub mod json;
 pub mod net;
 pub mod paths;
 pub mod png;
 pub mod process_manager;
 pub mod registry;
+pub mod secrets;
+pub mod session;
 pub mod settings;
 pub mod watcher;
 

@@ -11,26 +11,49 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use ugl_core::diagnostics;
 use ugl_core::integrations::manual::{self, FolderScan};
 use ugl_core::achievement_engine::AchievementView;
-use ugl_core::application::SteamAchievementJob;
-use ugl_core::domain::format_date;
+use ugl_core::application::{LaunchOutcome, SteamAchievementJob};
+use ugl_core::domain::{format_date, unix_now, LaunchSettings, MetadataRecord, OwnedGame};
 use ugl_core::icons;
+use ugl_core::integrations::executables::{self, CandidateStatus, ImportCandidate};
+use ugl_core::integrations::shortcut;
 use ugl_core::integrations::steam;
+use ugl_core::integrations::steam_account::{self, SteamInput};
 use ugl_core::integrations::steam_achievements;
+use ugl_core::integrations::steam_store::{self, SearchHit};
+use ugl_core::process_manager;
+use ugl_core::session::{self, SessionEnd, SessionSpec};
 use ugl_core::watcher::{SteamWatcher, WatchEvent};
 use ugl_core::{AppPaths, Core, Game, GameId, LaunchKind, SortOrder};
+
+mod tray;
 
 slint::include_modules!();
 
 /// Estado compartido entre el hilo de la interfaz y los hilos de análisis de disco.
+/// Un archivo de la vista previa de importación, con el nombre que el usuario va editando.
+struct PreviewEntry {
+    candidate: ImportCandidate,
+    name: String,
+    include: bool,
+}
+
 struct AppState {
     core: Mutex<Core>,
     search: Mutex<String>,
     /// Resultado del último análisis de carpeta, a la espera de que el usuario confirme.
     pending_scan: Mutex<Option<FolderScan>>,
+    /// Vista previa de la importación de ejecutables, a la espera de que el usuario confirme.
+    pending_preview: Mutex<Vec<PreviewEntry>>,
     /// Caché de imágenes de UGL (iconos de juegos y de logros).
     cache_dir: PathBuf,
     /// Evita lanzar dos extractores de iconos a la vez.
     icon_worker_running: AtomicBool,
+    /// Ídem para la descarga de fichas de Steam Store.
+    metadata_worker_running: AtomicBool,
+    /// Resultados de la última búsqueda en Steam Store (asociación manual).
+    link_results: Mutex<Vec<SearchHit>>,
+    /// Pide cancelar el inicio de sesión de Steam en curso.
+    account_cancel: AtomicBool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -106,12 +129,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         core: Mutex::new(core),
         search: Mutex::new(String::new()),
         pending_scan: Mutex::new(None),
+        pending_preview: Mutex::new(Vec::new()),
         cache_dir: paths.cache_dir.clone(),
         icon_worker_running: AtomicBool::new(false),
+        metadata_worker_running: AtomicBool::new(false),
+        link_results: Mutex::new(Vec::new()),
+        account_cancel: AtomicBool::new(false),
     });
 
     let ui = MainWindow::new()?;
-    ui.set_version_text(env!("CARGO_PKG_VERSION").into());
+    ui.set_version_text(format!("{} alpha", env!("CARGO_PKG_VERSION")).into());
     ui.set_data_dir(paths.data_dir.display().to_string().into());
     ui.set_db_path(paths.db_path.display().to_string().into());
     ui.set_log_path(paths.log_path.display().to_string().into());
@@ -120,6 +147,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         let core = lock(&state.core);
         ui.set_auto_update(core.auto_update_enabled());
         ui.set_download_icons(core.download_icons_enabled());
+        ui.set_fetch_metadata(core.fetch_metadata_enabled());
+        ui.set_minimize_on_launch(core.minimize_on_launch_enabled());
     }
 
     wire_library(&ui, &state);
@@ -127,11 +156,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     wire_detail(&ui, &state);
     wire_achievements(&ui, &state);
     wire_settings(&ui, &state);
+    wire_preview(&ui, &state);
+    wire_launch(&ui, &state);
+    wire_steam_link(&ui, &state);
+    wire_background(&ui, &state);
+    wire_account(&ui, &state);
     refresh_games(&ui, &state);
+    refresh_account_ui(&ui, &state);
     restart_automation(&ui, &state);
     startup_sync(ui.as_weak(), state.clone());
 
-    ui.run()?;
+    // Cerrar la ventana (X) sale de UGL; para dejarlo en segundo plano está el botón de la bandeja.
+    ui.window().on_close_requested(|| {
+        TRAY.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+        let _ = slint::quit_event_loop();
+        slint::CloseRequestResponse::HideWindow
+    });
+    MAIN_WINDOW.with(|slot| {
+        *slot.borrow_mut() = Some(ui.clone_strong());
+    });
+
+    ui.show()?;
+    // No `ui.run()`: así el programa sigue activo aunque la ventana esté oculta en la bandeja.
+    slint::run_event_loop_until_quit()?;
+
+    TRAY.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+    MAIN_WINDOW.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
     Ok(())
 }
 
@@ -148,6 +204,34 @@ fn source_label(source: &str) -> &'static str {
         "steam" => "Steam",
         "manual" => "Importado manualmente",
         _ => "Otra fuente",
+    }
+}
+
+/// «Valve · 16 NOV 2004 · Acción» a partir de la ficha de la tienda.
+fn metadata_info_line(record: &MetadataRecord) -> String {
+    let developers = record.developers.join(", ");
+    let genres = record.genres.join(", ");
+    [developers, record.release_date.clone(), genres]
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("  ·  ")
+}
+
+fn launch_description(game: &Game) -> String {
+    match game.launch_kind {
+        LaunchKind::Executable => {
+            let mut text = format!("Ejecutable directo: {}", game.launch_target);
+            if !game.launch_args.trim().is_empty() {
+                text.push_str(&format!("  ·  Argumentos: {}", game.launch_args.trim()));
+            }
+            if let Some(dir) = game.working_dir.as_deref().filter(|d| !d.is_empty()) {
+                text.push_str(&format!("  ·  Carpeta de trabajo: {dir}"));
+            }
+            text
+        }
+        LaunchKind::SteamUri => format!("Steam (AppID {})", game.launch_target),
+        LaunchKind::Uri => format!("Plataforma: {}", game.launch_target),
     }
 }
 
@@ -169,7 +253,7 @@ fn refresh_games(ui: &MainWindow, state: &AppState) {
     let result = lock(&state.core).list_games(&query);
     match result {
         Ok(games) => {
-            let items: Vec<GameItem> = games
+            let mut items: Vec<GameItem> = games
                 .iter()
                 .map(|game| {
                     let image = game_icon(game);
@@ -182,9 +266,34 @@ fn refresh_games(ui: &MainWindow, state: &AppState) {
                         has_icon: image.is_some(),
                         icon: image.unwrap_or_default(),
                         initial: initial_of(&game.title),
+                        owned_only: false,
                     }
                 })
                 .collect();
+
+            // Con una cuenta vinculada: también los juegos que tienes pero no están instalados. En la
+            // lista llevan la inicial (sin imagen) para no gastar memoria; su portada se carga al abrirlos.
+            let owned = {
+                let core = lock(&state.core);
+                if core.steam_account().is_some() && core.show_owned_enabled() {
+                    core.list_owned_only(&query)
+                } else {
+                    Vec::new()
+                }
+            };
+            for game in owned {
+                items.push(GameItem {
+                    id: game.app_id as i32,
+                    title: game.name.clone().into(),
+                    source: owned_source_line(&game).into(),
+                    ach_total: 0,
+                    ach_unlocked: 0,
+                    icon: Default::default(),
+                    has_icon: false,
+                    initial: initial_of(&game.name),
+                    owned_only: true,
+                });
+            }
             ui.set_games(ModelRc::new(VecModel::from(items)));
         }
         Err(err) => {
@@ -225,12 +334,30 @@ fn show_detail(ui: &MainWindow, state: &AppState, id: GameId) {
         }
     };
 
-    let (launch_text, can_change_exe, can_change_path) = match game.launch_kind {
-        LaunchKind::Executable => (game.launch_target.clone(), true, true),
-        LaunchKind::SteamUri => (format!("Steam (AppID {})", game.launch_target), false, false),
+    let launch_text = launch_description(&game);
+    let (can_change_exe, can_change_path) = match game.launch_kind {
+        LaunchKind::Executable => (true, true),
+        LaunchKind::SteamUri | LaunchKind::Uri => (false, false),
     };
+    let metadata = lock(&state.core).metadata(id).filter(|m| m.available);
+    let cover = metadata
+        .as_ref()
+        .and_then(|m| m.cover_path.as_deref())
+        .and_then(|path| cached_image(Path::new(path)));
+    let store_name = metadata.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+    let can_use_store_name = !store_name.is_empty() && store_name != game.title;
     let image = game_icon(&game);
     ui.set_detail(GameDetail {
+        has_cover: cover.is_some(),
+        cover: cover.unwrap_or_default(),
+        info: metadata.as_ref().map(metadata_info_line).unwrap_or_default().into(),
+        description: metadata
+            .as_ref()
+            .map(|m| m.short_description.clone())
+            .unwrap_or_default()
+            .into(),
+        store_name: store_name.into(),
+        can_use_store_name,
         id: game.id as i32,
         has_icon: image.is_some(),
         icon: image.unwrap_or_default(),
@@ -245,6 +372,7 @@ fn show_detail(ui: &MainWindow, state: &AppState, id: GameId) {
         ach_total: game.achievements_total as i32,
         ach_unlocked: game.achievements_unlocked as i32,
         can_show_achievements: game.launch_kind == LaunchKind::SteamUri
+            || game.steam_app_id.is_some()
             || game.achievements_total > 0,
     });
     ui.set_confirm_remove(false);
@@ -299,13 +427,20 @@ fn wire_library(ui: &MainWindow, state: &Arc<AppState>) {
             let result = lock(&state.core).launch_game(id as GameId);
             if let Some(ui) = weak.upgrade() {
                 match result {
-                    Ok(title) => set_status(&ui, format!("Iniciando «{title}»…")),
+                    Ok(outcome) => {
+                        set_status(&ui, format!("Iniciando «{}»…", outcome.title));
+                        refresh_games(&ui, &state);
+                        let minimize = lock(&state.core).minimize_on_launch_enabled();
+                        if minimize {
+                            begin_background_session(&ui, &state, outcome);
+                        }
+                    }
                     Err(err) => {
                         diagnostics::warn(&format!("No se pudo iniciar el juego {id}: {err}"));
                         set_status(&ui, format!("No se pudo iniciar el juego: {err}"));
+                        refresh_games(&ui, &state);
                     }
                 }
-                refresh_games(&ui, &state);
             }
         }
     });
@@ -1099,6 +1234,8 @@ fn sync_steam_library(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>) {
 /// Busca en segundo plano el icono de los juegos que aún no lo tienen. Si ya hay un extractor
 /// trabajando, no hace nada (ese mismo repasará los juegos nuevos al terminar su tanda).
 fn kick_icon_worker(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
+    // Toda alta de juegos pasa por aquí: se aprovecha para pedir también las fichas de la tienda.
+    kick_metadata_worker(weak.clone(), state.clone());
     if state.icon_worker_running.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -1162,6 +1299,10 @@ fn startup_sync(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
             }
         }
         kick_icon_worker(weak.clone(), state.clone());
+        if auto {
+            let state_for_ui = state.clone();
+            let _ = weak.upgrade_in_event_loop(move |ui| maybe_auto_sync_account(&ui, &state_for_ui));
+        }
     });
 }
 
@@ -1188,6 +1329,46 @@ fn wire_settings(ui: &MainWindow, state: &Arc<AppState>) {
         }
     });
 
+    ui.on_fetch_metadata_toggled({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |enabled| {
+            let saved = lock(&state.core).set_fetch_metadata_enabled(enabled);
+            if let Err(err) = saved {
+                diagnostics::warn(&format!("No se pudo guardar el ajuste: {err}"));
+            }
+            if let Some(ui) = weak.upgrade() {
+                if enabled {
+                    set_status(&ui, "Se descargarán las fichas públicas de Steam Store.");
+                    kick_metadata_worker(ui.as_weak(), state.clone());
+                } else {
+                    set_status(&ui, "UGL no consultará Steam Store: usará solo las fichas ya guardadas.");
+                }
+            }
+        }
+    });
+
+    ui.on_minimize_on_launch_toggled({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |enabled| {
+            let saved = lock(&state.core).set_minimize_on_launch_enabled(enabled);
+            if let Err(err) = saved {
+                diagnostics::warn(&format!("No se pudo guardar el ajuste: {err}"));
+            }
+            if let Some(ui) = weak.upgrade() {
+                set_status(
+                    &ui,
+                    if enabled {
+                        "UGL se minimizará a la bandeja al iniciar un juego."
+                    } else {
+                        "UGL se quedará visible al iniciar un juego."
+                    },
+                );
+            }
+        }
+    });
+
     ui.on_download_icons_toggled({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -1208,4 +1389,1217 @@ fn wire_settings(ui: &MainWindow, state: &Arc<AppState>) {
             }
         }
     });
+}
+
+// ---------------------------------------------------------------------------
+// Importación múltiple de ejecutables, con vista previa
+// ---------------------------------------------------------------------------
+
+fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
+    // Varios .exe (o .lnk/.url) a la vez.
+    ui.on_import_exes_clicked({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_busy(true);
+                set_status(&ui, "Selecciona los juegos…");
+            }
+            let start_dir = lock(&state.core).last_import_dir();
+            let weak = weak.clone();
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Selecciona uno o varios juegos")
+                    .add_filter("Juegos (.exe, .lnk, .url)", &["exe", "lnk", "url"]);
+                if let Some(dir) = start_dir {
+                    dialog = dialog.set_directory(dir);
+                }
+                let picked = dialog.pick_files();
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_busy(false);
+                    match picked {
+                        Some(paths) if !paths.is_empty() => {
+                            lock(&state.core).remember_import_dir(&paths[0]);
+                            start_preview(&ui, &state, paths);
+                        }
+                        _ => set_status(&ui, ""),
+                    }
+                });
+            });
+        }
+    });
+
+    // Accesos directos de una carpeta (así no se pierden sus argumentos).
+    ui.on_import_shortcuts_clicked({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_busy(true);
+                set_status(&ui, "Selecciona la carpeta con los accesos directos…");
+            }
+            let start_dir = lock(&state.core).last_import_dir();
+            let weak = weak.clone();
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Selecciona la carpeta con los accesos directos");
+                if let Some(dir) = start_dir {
+                    dialog = dialog.set_directory(dir);
+                }
+                let paths = dialog
+                    .pick_folder()
+                    .map(|folder| executables::list_shortcuts(&folder, 500))
+                    .unwrap_or_default();
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_busy(false);
+                    if paths.is_empty() {
+                        set_status(&ui, "No se encontraron accesos directos (.lnk/.url) en esa carpeta.");
+                    } else {
+                        start_preview(&ui, &state, paths);
+                    }
+                });
+            });
+        }
+    });
+
+    ui.on_preview_toggled({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |index, include| {
+            {
+                let mut entries = lock(&state.pending_preview);
+                if let Some(entry) = usize::try_from(index)
+                    .ok()
+                    .and_then(|i| entries.get_mut(i))
+                {
+                    if entry.candidate.status == CandidateStatus::New {
+                        entry.include = include;
+                    }
+                }
+            }
+            if let Some(ui) = weak.upgrade() {
+                render_preview(&ui, &state);
+            }
+        }
+    });
+
+    // Editar un nombre solo cambia el estado interno (no se repinta: así no se pierde el foco).
+    ui.on_preview_name_edited({
+        let state = state.clone();
+        move |index, text| {
+            let mut entries = lock(&state.pending_preview);
+            if let Some(entry) = usize::try_from(index)
+                .ok()
+                .and_then(|i| entries.get_mut(i))
+            {
+                entry.name = text.to_string();
+            }
+        }
+    });
+
+    ui.on_preview_cancel({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            lock(&state.pending_preview).clear();
+            if let Some(ui) = weak.upgrade() {
+                ui.set_preview_visible(false);
+                set_status(&ui, "");
+            }
+        }
+    });
+
+    ui.on_preview_confirm({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let items: Vec<(ImportCandidate, String)> = lock(&state.pending_preview)
+                .iter()
+                .filter(|e| e.include && e.candidate.status == CandidateStatus::New)
+                .map(|e| (e.candidate.clone(), e.name.clone()))
+                .collect();
+            if items.is_empty() {
+                set_status(&ui, "No hay nada seleccionado para importar.");
+                return;
+            }
+            let result = lock(&state.core).import_candidates(&items);
+            match result {
+                Ok(summary) => {
+                    lock(&state.pending_preview).clear();
+                    ui.set_preview_visible(false);
+                    ui.set_current_view(0);
+                    let mut message = format!("{} juego(s) añadido(s) a la biblioteca.", summary.added);
+                    if summary.already_present > 0 {
+                        message.push_str(&format!(" {} ya estaba(n).", summary.already_present));
+                    }
+                    set_status(&ui, message);
+                    refresh_games(&ui, &state);
+                    kick_icon_worker(ui.as_weak(), state.clone());
+                }
+                Err(err) => {
+                    diagnostics::warn(&format!("No se pudo importar la selección: {err}"));
+                    set_status(&ui, format!("No se pudo importar: {err}"));
+                }
+            }
+        }
+    });
+}
+
+fn start_preview(ui: &MainWindow, state: &Arc<AppState>, paths: Vec<PathBuf>) {
+    let candidates = lock(&state.core).preview_import(&paths);
+    let entries: Vec<PreviewEntry> = candidates
+        .into_iter()
+        .map(|candidate| PreviewEntry {
+            name: candidate.name.clone(),
+            include: candidate.status == CandidateStatus::New,
+            candidate,
+        })
+        .collect();
+    *lock(&state.pending_preview) = entries;
+    render_preview(ui, state);
+    ui.set_preview_visible(true);
+}
+
+fn render_preview(ui: &MainWindow, state: &AppState) {
+    let entries = lock(&state.pending_preview);
+    let items: Vec<PreviewItem> = entries
+        .iter()
+        .map(|entry| {
+            let candidate = &entry.candidate;
+            let (status, kind) = match candidate.status {
+                CandidateStatus::New => ("Nuevo", 0),
+                CandidateStatus::Duplicate => ("Duplicado", 1),
+                CandidateStatus::Invalid => ("No válido", 2),
+            };
+            // Para los válidos, el detalle muestra el ejecutable real y los argumentos detectados.
+            let note = if !candidate.note.is_empty() {
+                candidate.note.clone()
+            } else if candidate.kind == LaunchKind::SteamUri {
+                "Se iniciará con Steam.".to_string()
+            } else {
+                let exe = candidate
+                    .exe
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                if candidate.args.is_empty() {
+                    exe
+                } else {
+                    format!("{exe}  ·  Argumentos: {}", candidate.args)
+                }
+            };
+            PreviewItem {
+                include: entry.include,
+                name: entry.name.clone().into(),
+                path: candidate.source.display().to_string().into(),
+                note: note.into(),
+                status: status.into(),
+                status_kind: kind,
+                selectable: candidate.status == CandidateStatus::New,
+            }
+        })
+        .collect();
+
+    let to_import = entries
+        .iter()
+        .filter(|e| e.include && e.candidate.status == CandidateStatus::New)
+        .count();
+    let duplicates = entries
+        .iter()
+        .filter(|e| e.candidate.status == CandidateStatus::Duplicate)
+        .count();
+    let invalid = entries
+        .iter()
+        .filter(|e| e.candidate.status == CandidateStatus::Invalid)
+        .count();
+    drop(entries);
+
+    ui.set_preview_items(ModelRc::new(VecModel::from(items)));
+    ui.set_preview_selected(to_import as i32);
+    ui.set_preview_summary(
+        format!(
+            "{to_import} para importar · {duplicates} duplicado(s) omitido(s) · {invalid} no válido(s). \
+             Puedes editar los nombres antes de importar."
+        )
+        .into(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Método de inicio de cada juego
+// ---------------------------------------------------------------------------
+
+fn wire_launch(ui: &MainWindow, state: &Arc<AppState>) {
+    ui.on_launch_settings_clicked({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |id| {
+            if let Some(ui) = weak.upgrade() {
+                open_launch_dialog(&ui, &state, id as GameId);
+            }
+        }
+    });
+
+    ui.on_launch_cancel({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_launch_dialog_visible(false);
+            }
+        }
+    });
+
+    ui.on_launch_browse_exe({
+        let weak = ui.as_weak();
+        move || {
+            let current = weak
+                .upgrade()
+                .map(|ui| ui.get_launch_exe().to_string())
+                .unwrap_or_default();
+            let start_dir = Path::new(&current)
+                .parent()
+                .filter(|dir| dir.is_dir())
+                .map(Path::to_path_buf);
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let mut dialog = rfd::FileDialog::new()
+                    .set_title("Selecciona el ejecutable del juego")
+                    .add_filter("Ejecutables y accesos directos", &["exe", "lnk"]);
+                if let Some(dir) = start_dir {
+                    dialog = dialog.set_directory(dir);
+                }
+                let Some(file) = dialog.pick_file() else {
+                    return;
+                };
+                let _ = weak.upgrade_in_event_loop(move |ui| apply_picked_executable(&ui, &file));
+            });
+        }
+    });
+
+    ui.on_launch_browse_workdir({
+        let weak = ui.as_weak();
+        move || {
+            let weak = weak.clone();
+            std::thread::spawn(move || {
+                let Some(folder) = rfd::FileDialog::new()
+                    .set_title("Selecciona el directorio de trabajo")
+                    .pick_folder()
+                else {
+                    return;
+                };
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_launch_workdir(folder.display().to_string().into());
+                });
+            });
+        }
+    });
+
+    ui.on_launch_save({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |id| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let non_empty = |text: String| -> Option<String> {
+                let text = text.trim().to_string();
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text)
+                }
+            };
+
+            let steam_app_id = match non_empty(ui.get_launch_steam_id().to_string()) {
+                None => None,
+                Some(text) => match text.parse::<u64>() {
+                    Ok(app_id) => Some(app_id),
+                    Err(_) => {
+                        ui.set_launch_error("El AppID de Steam debe ser un número.".into());
+                        return;
+                    }
+                },
+            };
+            let settings = LaunchSettings {
+                kind: LaunchKind::from_index(ui.get_launch_method()),
+                exe: non_empty(ui.get_launch_exe().to_string()).map(PathBuf::from),
+                args: ui.get_launch_args().to_string(),
+                working_dir: non_empty(ui.get_launch_workdir().to_string()).map(PathBuf::from),
+                steam_app_id,
+                uri: non_empty(ui.get_launch_uri().to_string()),
+            };
+
+            let result = lock(&state.core).update_launch(id as GameId, &settings);
+            match result {
+                Ok(()) => {
+                    ui.set_launch_dialog_visible(false);
+                    set_status(&ui, "Método de inicio actualizado.");
+                    show_detail(&ui, &state, id as GameId);
+                    refresh_games(&ui, &state);
+                    kick_icon_worker(ui.as_weak(), state.clone());
+                }
+                Err(err) => ui.set_launch_error(err.to_string().into()),
+            }
+        }
+    });
+}
+
+fn open_launch_dialog(ui: &MainWindow, state: &AppState, id: GameId) {
+    let loaded = lock(&state.core).game(id);
+    let game = match loaded {
+        Ok(game) => game,
+        Err(err) => {
+            set_status(ui, format!("No se pudo abrir el juego: {err}"));
+            return;
+        }
+    };
+    let exe = game
+        .exe_path
+        .as_deref()
+        .filter(|path| !path.is_empty())
+        .map(|path| game.install_path.join(path).display().to_string())
+        .unwrap_or_default();
+    let uri = if game.launch_kind == LaunchKind::Uri {
+        game.launch_target.clone()
+    } else {
+        String::new()
+    };
+    let steam_id = game
+        .steam_app_id
+        .map(|app_id| app_id.to_string())
+        .unwrap_or_default();
+
+    ui.set_launch_game_id(id as i32);
+    ui.set_launch_game_title(game.title.clone().into());
+    ui.set_launch_method(game.launch_kind.index());
+    ui.set_launch_exe(exe.into());
+    ui.set_launch_args(game.launch_args.clone().into());
+    ui.set_launch_workdir(game.working_dir.clone().unwrap_or_default().into());
+    ui.set_launch_steam_id(steam_id.into());
+    ui.set_launch_uri(uri.into());
+    ui.set_launch_error("".into());
+    ui.set_launch_dialog_visible(true);
+}
+
+/// Si se elige un acceso directo, se usa su ejecutable real, sus argumentos y su directorio de trabajo.
+fn apply_picked_executable(ui: &MainWindow, file: &Path) {
+    if !shortcut::is_shortcut(file) {
+        ui.set_launch_exe(file.display().to_string().into());
+        ui.set_launch_error("".into());
+        return;
+    }
+    match shortcut::read_shortcut(file) {
+        Ok(info) => match info.target {
+            Some(target) => {
+                ui.set_launch_exe(target.display().to_string().into());
+                if !info.arguments.is_empty() {
+                    ui.set_launch_args(info.arguments.into());
+                }
+                if let Some(dir) = info.working_dir {
+                    ui.set_launch_workdir(dir.display().to_string().into());
+                }
+                ui.set_launch_error("".into());
+            }
+            None => ui.set_launch_error("El acceso directo no indica un ejecutable.".into()),
+        },
+        Err(err) => ui.set_launch_error(err.to_string().into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fichas de Steam Store (guardadas en local) y asociación manual
+// ---------------------------------------------------------------------------
+
+/// Descarga en segundo plano la ficha pública de los juegos con AppID que aún no la tienen.
+/// Un fallo de red no se guarda: se reintentará la próxima vez.
+fn kick_metadata_worker(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
+    if !lock(&state.core).fetch_metadata_enabled() {
+        return;
+    }
+    if state.metadata_worker_running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut handled: HashSet<GameId> = HashSet::new();
+        loop {
+            let jobs: Vec<_> = lock(&state.core)
+                .metadata_jobs(10)
+                .into_iter()
+                .filter(|job| !handled.contains(&job.game_id))
+                .collect();
+            if jobs.is_empty() {
+                break;
+            }
+
+            let mut updated: Vec<GameId> = Vec::new();
+            for job in &jobs {
+                handled.insert(job.game_id);
+                match steam_store::fetch_record(job.app_id, &state.cache_dir) {
+                    Ok(record) => {
+                        let saved = lock(&state.core).save_metadata(job.game_id, &record);
+                        match saved {
+                            Ok(()) => updated.push(job.game_id),
+                            Err(err) => diagnostics::warn(&format!(
+                                "No se pudo guardar la ficha del juego {}: {err}",
+                                job.game_id
+                            )),
+                        }
+                    }
+                    Err(err) => diagnostics::info(&format!(
+                        "Sin ficha de Steam Store para el AppID {} (se reintentará): {err}",
+                        job.app_id
+                    )),
+                }
+                // Cortesía con el servidor: una petición cada medio segundo como máximo.
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+
+            if !updated.is_empty() {
+                let state_for_ui = state.clone();
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    refresh_games(&ui, &state_for_ui);
+                    if ui.get_detail_visible() {
+                        let open = ui.get_detail().id as GameId;
+                        if updated.contains(&open) {
+                            show_detail(&ui, &state_for_ui, open);
+                        }
+                    }
+                });
+            }
+        }
+        state.metadata_worker_running.store(false, Ordering::SeqCst);
+    });
+}
+
+fn wire_steam_link(ui: &MainWindow, state: &Arc<AppState>) {
+    ui.on_steam_link_clicked({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |id| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let id = id as GameId;
+            let loaded = {
+                let core = lock(&state.core);
+                core.game(id).map(|game| (game, core.metadata(id)))
+            };
+            let (game, metadata) = match loaded {
+                Ok(pair) => pair,
+                Err(err) => {
+                    set_status(&ui, format!("No se pudo abrir el juego: {err}"));
+                    return;
+                }
+            };
+            lock(&state.link_results).clear();
+            ui.set_link_game_id(id as i32);
+            ui.set_link_game_title(game.title.clone().into());
+            let query = metadata
+                .filter(|m| m.available && !m.name.is_empty())
+                .map(|m| m.name)
+                .unwrap_or_else(|| game.title.clone());
+            ui.set_link_query(query.into());
+            ui.set_link_results(ModelRc::new(VecModel::from(Vec::<LinkResult>::new())));
+            ui.set_link_selected(-1);
+            ui.set_link_busy(false);
+            ui.set_link_status(
+                "Escribe el nombre del juego o su AppID y pulsa Buscar. Consulta la tienda pública de Steam (no necesita Steam instalado)."
+                    .into(),
+            );
+            ui.set_link_dialog_visible(true);
+        }
+    });
+
+    ui.on_steam_link_search({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |query| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let query = query.trim().to_string();
+            if query.is_empty() {
+                ui.set_link_status("Escribe un nombre o un AppID.".into());
+                return;
+            }
+            ui.set_link_busy(true);
+            ui.set_link_status("Buscando en Steam Store…".into());
+
+            let weak = weak.clone();
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let work_dir = state.cache_dir.join("tmp");
+                // Un número se trata como AppID; cualquier otra cosa, como nombre a buscar.
+                let outcome: Result<Vec<SearchHit>, String> = match query.parse::<u64>() {
+                    Ok(app_id) => match steam_store::fetch_info(app_id, &work_dir) {
+                        Ok(Some(info)) => Ok(vec![SearchHit {
+                            app_id,
+                            name: info.name,
+                        }]),
+                        Ok(None) => Ok(Vec::new()),
+                        Err(err) => Err(err.to_string()),
+                    },
+                    Err(_) => steam_store::search(&query, &work_dir).map_err(|err| err.to_string()),
+                };
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_link_busy(false);
+                    match outcome {
+                        Ok(hits) => {
+                            let items: Vec<LinkResult> = hits
+                                .iter()
+                                .map(|hit| LinkResult {
+                                    name: hit.name.clone().into(),
+                                    app_id: hit.app_id.to_string().into(),
+                                })
+                                .collect();
+                            ui.set_link_status(
+                                if hits.is_empty() {
+                                    "No se encontró nada con ese nombre o AppID.".to_string()
+                                } else {
+                                    format!("{} resultado(s). Elige el correcto y pulsa Asociar.", hits.len())
+                                }
+                                .into(),
+                            );
+                            ui.set_link_selected(if hits.len() == 1 { 0 } else { -1 });
+                            *lock(&state.link_results) = hits;
+                            ui.set_link_results(ModelRc::new(VecModel::from(items)));
+                        }
+                        Err(message) => ui.set_link_status(
+                            format!("No se pudo consultar Steam Store (¿sin conexión?): {message}").into(),
+                        ),
+                    }
+                });
+            });
+        }
+    });
+
+    ui.on_steam_link_confirm({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |id| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let hit = usize::try_from(ui.get_link_selected())
+                .ok()
+                .and_then(|index| lock(&state.link_results).get(index).cloned());
+            let Some(hit) = hit else {
+                ui.set_link_status("Elige primero un resultado de la lista.".into());
+                return;
+            };
+            let result = lock(&state.core).associate_steam(id as GameId, hit.app_id);
+            match result {
+                Ok(()) => {
+                    ui.set_link_dialog_visible(false);
+                    set_status(
+                        &ui,
+                        format!(
+                            "Asociado con «{}» (AppID {}). El método de inicio no ha cambiado.",
+                            hit.name, hit.app_id
+                        ),
+                    );
+                    show_detail(&ui, &state, id as GameId);
+                    refresh_games(&ui, &state);
+                    kick_metadata_worker(ui.as_weak(), state.clone());
+                }
+                Err(err) => ui.set_link_status(format!("No se pudo asociar: {err}").into()),
+            }
+        }
+    });
+
+    ui.on_steam_link_cancel({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_link_dialog_visible(false);
+            }
+        }
+    });
+
+    ui.on_use_store_name_clicked({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |id| {
+            let name = lock(&state.core)
+                .metadata(id as GameId)
+                .map(|m| m.name)
+                .filter(|name| !name.is_empty());
+            let Some(name) = name else {
+                return;
+            };
+            let result = lock(&state.core).rename_game(id as GameId, &name);
+            if let Some(ui) = weak.upgrade() {
+                match result {
+                    Ok(()) => {
+                        set_status(&ui, format!("Nombre actualizado: «{name}»."));
+                        show_detail(&ui, &state, id as GameId);
+                        refresh_games(&ui, &state);
+                    }
+                    Err(err) => set_status(&ui, format!("No se pudo cambiar el nombre: {err}")),
+                }
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Segundo plano: bandeja del sistema y seguimiento de la sesión de juego
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    // La ventana principal y la bandeja solo existen en el hilo de la interfaz. Los manejadores de
+    // la bandeja se limitan a pedir, con `invoke_from_event_loop`, que se actúe sobre ellas.
+    static MAIN_WINDOW: RefCell<Option<MainWindow>> = RefCell::new(None);
+    static TRAY: RefCell<Option<tray::Tray>> = RefCell::new(None);
+}
+
+fn on_tray_open() {
+    let _ = slint::invoke_from_event_loop(|| {
+        MAIN_WINDOW.with(|slot| {
+            if let Some(ui) = slot.borrow().as_ref() {
+                restore_from_tray(ui);
+            }
+        });
+    });
+}
+
+fn on_tray_quit() {
+    let _ = slint::invoke_from_event_loop(|| {
+        TRAY.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+        let _ = slint::quit_event_loop();
+    });
+}
+
+/// Oculta UGL y deja su icono en la bandeja. Sin bandeja disponible, lo minimiza normalmente.
+fn minimize_to_tray(ui: &MainWindow) -> bool {
+    let already = TRAY.with(|slot| slot.borrow().is_some());
+    let ready = already || {
+        match ui.get_app_icon().to_rgba8() {
+            Some(buffer) => match tray::create(
+                buffer.as_bytes().to_vec(),
+                buffer.width(),
+                buffer.height(),
+                on_tray_open,
+                on_tray_quit,
+            ) {
+                Ok(handle) => {
+                    TRAY.with(|slot| {
+                        *slot.borrow_mut() = Some(handle);
+                    });
+                    true
+                }
+                Err(err) => {
+                    diagnostics::warn(&format!("No se pudo crear el icono de la bandeja: {err}"));
+                    false
+                }
+            },
+            None => {
+                diagnostics::warn("No se pudo leer el icono de UGL para la bandeja");
+                false
+            }
+        }
+    };
+
+    if ready {
+        ACH_WINDOW.with(|slot| {
+            if let Some(win) = slot.borrow().as_ref() {
+                let _ = win.hide();
+            }
+        });
+        let _ = ui.hide();
+    } else {
+        ui.window().set_minimized(true);
+    }
+    ready
+}
+
+/// Vuelve a mostrar UGL y quita su icono de la bandeja.
+fn restore_from_tray(ui: &MainWindow) {
+    TRAY.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+    let _ = ui.show();
+    ui.window().set_minimized(false);
+}
+
+fn wire_background(ui: &MainWindow, _state: &Arc<AppState>) {
+    ui.on_minimize_to_tray_clicked({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                minimize_to_tray(&ui);
+            }
+        }
+    });
+}
+
+/// Al iniciar un juego: UGL pasa a segundo plano y, cuando el juego se cierra, vuelve solo.
+fn begin_background_session(ui: &MainWindow, state: &Arc<AppState>, outcome: LaunchOutcome) {
+    minimize_to_tray(ui);
+
+    let spec = SessionSpec {
+        root_pid: outcome.pid,
+        watch_dir: outcome.watch_dir,
+    };
+    let title = outcome.title;
+    let weak = ui.as_weak();
+    let state = state.clone();
+    std::thread::spawn(move || {
+        let end = session::wait_for_game(&spec);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            restore_from_tray(&ui);
+            refresh_games(&ui, &state);
+            let message = match end {
+                SessionEnd::Ended => format!("«{title}» se ha cerrado. UGL vuelve a estar activo."),
+                SessionEnd::NeverStarted => {
+                    format!("No se detectó el proceso de «{title}»; UGL vuelve a mostrarse.")
+                }
+                SessionEnd::Unsupported => {
+                    "No se puede seguir el juego en este sistema; UGL vuelve a mostrarse.".to_string()
+                }
+            };
+            set_status(&ui, message);
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Cuenta de Steam (opcional): inicio de sesión, clave de la API y biblioteca
+// ---------------------------------------------------------------------------
+
+fn hours_text(minutes: u64) -> String {
+    if minutes == 0 {
+        "sin jugar".to_string()
+    } else {
+        format!("{:.1} h jugadas", minutes as f64 / 60.0)
+    }
+}
+
+fn owned_source_line(game: &OwnedGame) -> String {
+    format!(
+        "Cuenta de Steam  ·  No instalado  ·  {}",
+        hours_text(game.playtime_minutes)
+    )
+}
+
+/// Pinta en la vista «Cuenta de Steam» lo que UGL sabe: cuenta, clave y última sincronización.
+fn refresh_account_ui(ui: &MainWindow, state: &AppState) {
+    let (account, counts, last_sync, show_owned) = {
+        let core = lock(&state.core);
+        (
+            core.steam_account(),
+            core.account_library_counts(),
+            core.last_account_sync(),
+            core.show_owned_enabled(),
+        )
+    };
+    ui.set_show_owned(show_owned);
+    ui.set_account_linked(account.is_some());
+    ui.set_account_has_key(account.as_ref().map_or(false, |a| a.has_api_key));
+
+    match &account {
+        None => {
+            ui.set_account_status(
+                "No hay ninguna cuenta vinculada. Es opcional: UGL funciona igual sin ella.".into(),
+            );
+            ui.set_account_key_status("".into());
+            ui.set_account_sync_status("".into());
+        }
+        Some(account) => {
+            let who = account
+                .persona
+                .clone()
+                .unwrap_or_else(|| format!("SteamID {}", account.steam_id));
+            let trust = if account.verified {
+                "identidad confirmada por Steam"
+            } else {
+                "introducida a mano, sin confirmar"
+            };
+            ui.set_account_status(format!("Cuenta vinculada: {who} ({trust}).").into());
+            ui.set_account_key_status(
+                if account.has_api_key {
+                    "Guardada y cifrada en este equipo."
+                } else {
+                    "No guardada: sin ella UGL no puede leer tu biblioteca."
+                }
+                .into(),
+            );
+            ui.set_account_sync_status(
+                match last_sync {
+                    Some(time) => format!(
+                        "Última sincronización: {}  ·  {} juegos en tu cuenta, {} sin instalar.",
+                        format_date(time),
+                        counts.0,
+                        counts.1
+                    ),
+                    None => "Aún no se ha sincronizado la biblioteca.".to_string(),
+                }
+                .into(),
+            );
+        }
+    }
+}
+
+fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
+    // --- Iniciar sesión con Steam (OpenID en el navegador) ---
+    ui.on_account_login_clicked({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let session = match steam_account::begin_login() {
+                Ok(session) => session,
+                Err(err) => {
+                    set_status(&ui, format!("No se pudo preparar el inicio de sesión: {err}"));
+                    return;
+                }
+            };
+            // La dirección se muestra siempre: si el navegador no se abre solo, se puede pegar a mano.
+            ui.set_account_login_url(session.login_url.clone().into());
+            let opened = process_manager::open_web_url(&session.login_url);
+            state.account_cancel.store(false, Ordering::SeqCst);
+            ui.set_account_busy(true);
+            match &opened {
+                Ok(()) => ui.set_account_status(
+                    "Se abrió tu navegador. Inicia sesión en la página de Steam y vuelve aquí. Si no lo ves, copia la dirección de abajo y pégala en tu navegador."
+                        .into(),
+                ),
+                Err(err) => {
+                    diagnostics::warn(&format!("No se pudo abrir el navegador: {err}"));
+                    ui.set_account_status(
+                        format!(
+                            "No pude abrir el navegador automáticamente ({err}). Copia la dirección de abajo, pégala en tu navegador e inicia sesión: UGL sigue esperando."
+                        )
+                        .into(),
+                    );
+                }
+            }
+
+            let weak = weak.clone();
+            let state = state.clone();
+            std::thread::spawn(move || {
+                let outcome = session.wait(std::time::Duration::from_secs(240), &state.account_cancel);
+                let _ = weak.upgrade_in_event_loop(move |ui| {
+                    ui.set_account_busy(false);
+                    ui.set_account_login_url("".into());
+                    match outcome {
+                        Ok(identity) => finish_link(&ui, &state, identity.steam_id, identity.verified),
+                        Err(err) => {
+                            refresh_account_ui(&ui, &state);
+                            set_status(&ui, err.to_string());
+                        }
+                    }
+                });
+            });
+        }
+    });
+
+    ui.on_account_cancel_clicked({
+        let state = state.clone();
+        move || state.account_cancel.store(true, Ordering::SeqCst)
+    });
+
+    ui.on_account_unlink_clicked({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let result = lock(&state.core).unlink_steam_account();
+            if let Some(ui) = weak.upgrade() {
+                match result {
+                    Ok(()) => set_status(
+                        &ui,
+                        "Cuenta desvinculada. Se borraron tu clave y la copia local de tu biblioteca.",
+                    ),
+                    Err(err) => set_status(&ui, format!("No se pudo desvincular: {err}")),
+                }
+                refresh_account_ui(&ui, &state);
+                refresh_games(&ui, &state);
+            }
+        }
+    });
+
+    // --- Vincular a mano (SteamID64, dirección del perfil o nombre del perfil) ---
+    ui.on_account_link_manual({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |text| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            match steam_account::parse_account_input(text.as_str()) {
+                Some(SteamInput::Id(steam_id)) => {
+                    ui.set_account_id_input("".into());
+                    finish_link(&ui, &state, steam_id, false);
+                }
+                Some(SteamInput::Vanity(name)) => {
+                    let key = lock(&state.core).api_key();
+                    let Some(key) = key else {
+                        set_status(
+                            &ui,
+                            "Para usar el nombre de tu perfil hace falta tu clave de la Web API. Guárdala primero, o escribe tu SteamID64 / la dirección con /profiles/…",
+                        );
+                        return;
+                    };
+                    ui.set_account_busy(true);
+                    let weak = weak.clone();
+                    let state = state.clone();
+                    std::thread::spawn(move || {
+                        let resolved =
+                            steam_account::resolve_vanity(&key, &name, &state.cache_dir.join("tmp"));
+                        let _ = weak.upgrade_in_event_loop(move |ui| {
+                            ui.set_account_busy(false);
+                            match resolved {
+                                Ok(Some(steam_id)) => {
+                                    ui.set_account_id_input("".into());
+                                    finish_link(&ui, &state, steam_id, false);
+                                }
+                                Ok(None) => set_status(&ui, "Steam no conoce ese nombre de perfil."),
+                                Err(err) => set_status(&ui, err.to_string()),
+                            }
+                        });
+                    });
+                }
+                None => set_status(
+                    &ui,
+                    "No reconozco ese dato. Escribe tu SteamID64 (17 cifras) o la dirección de tu perfil.",
+                ),
+            }
+        }
+    });
+
+    // --- Clave de la Web API ---
+    ui.on_account_save_key({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |text| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let result = lock(&state.core).set_api_key(text.as_str());
+            match result {
+                Ok(()) => {
+                    ui.set_account_key_input("".into());
+                    set_status(&ui, "Clave guardada (cifrada en este equipo).");
+                    refresh_account_ui(&ui, &state);
+                    if lock(&state.core).steam_account().is_some() {
+                        start_account_sync(&ui, &state);
+                    }
+                }
+                Err(err) => set_status(&ui, format!("No se pudo guardar la clave: {err}")),
+            }
+        }
+    });
+
+    ui.on_account_open_key_page({
+        let weak = ui.as_weak();
+        move || {
+            if let Err(err) = process_manager::open_web_url(steam_account::API_KEY_PAGE) {
+                if let Some(ui) = weak.upgrade() {
+                    set_status(&ui, format!("No se pudo abrir el navegador: {err}"));
+                }
+            }
+        }
+    });
+
+    ui.on_account_sync_clicked({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                start_account_sync(&ui, &state);
+            }
+        }
+    });
+
+    ui.on_show_owned_toggled({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |enabled| {
+            let saved = lock(&state.core).set_show_owned_enabled(enabled);
+            if let Err(err) = saved {
+                diagnostics::warn(&format!("No se pudo guardar el ajuste: {err}"));
+            }
+            if let Some(ui) = weak.upgrade() {
+                refresh_games(&ui, &state);
+            }
+        }
+    });
+
+    // --- Juegos de la cuenta que no están instalados ---
+    ui.on_owned_clicked({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |app_id| {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+            let app_id = app_id as u64;
+            let found = lock(&state.core)
+                .list_owned_only("")
+                .into_iter()
+                .find(|game| game.app_id == app_id);
+            let Some(game) = found else {
+                return;
+            };
+            let last_played = match game.last_played_at {
+                Some(time) => format!("Última partida: {}", format_date(time)),
+                None => "Nunca jugado".to_string(),
+            };
+            ui.set_owned_app_id(app_id as i32);
+            ui.set_owned_title(game.name.clone().into());
+            ui.set_owned_info(
+                format!("Tiempo de juego: {}  ·  {last_played}", hours_text(game.playtime_minutes)).into(),
+            );
+            let cover_file = steam_store::cover_path(&state.cache_dir, app_id);
+            let cover = slint::Image::load_from_path(&cover_file).ok();
+            ui.set_owned_has_cover(cover.is_some());
+            ui.set_owned_cover(cover.unwrap_or_default());
+            ui.set_owned_dialog_visible(true);
+
+            // La portada se descarga solo al abrir el juego (bajo demanda) y si la descarga está permitida.
+            if !cover_file.is_file() && lock(&state.core).fetch_metadata_enabled() {
+                let weak = weak.clone();
+                let state = state.clone();
+                std::thread::spawn(move || {
+                    if let Ok(path) = steam_store::ensure_cover(app_id, &state.cache_dir) {
+                        let _ = weak.upgrade_in_event_loop(move |ui| {
+                            if ui.get_owned_dialog_visible() && ui.get_owned_app_id() as u64 == app_id {
+                                if let Ok(image) = slint::Image::load_from_path(&path) {
+                                    ui.set_owned_cover(image);
+                                    ui.set_owned_has_cover(true);
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        }
+    });
+
+    ui.on_owned_store({
+        let weak = ui.as_weak();
+        move |app_id| {
+            let url = format!("https://store.steampowered.com/app/{app_id}");
+            if let Err(err) = process_manager::open_web_url(&url) {
+                if let Some(ui) = weak.upgrade() {
+                    set_status(&ui, format!("No se pudo abrir la tienda: {err}"));
+                }
+            }
+        }
+    });
+
+    ui.on_owned_close({
+        let weak = ui.as_weak();
+        move || {
+            if let Some(ui) = weak.upgrade() {
+                ui.set_owned_dialog_visible(false);
+            }
+        }
+    });
+}
+
+/// Guarda la cuenta vinculada y, si ya hay clave, trae su biblioteca.
+fn finish_link(ui: &MainWindow, state: &Arc<AppState>, steam_id: u64, verified: bool) {
+    let linked = lock(&state.core).link_steam_account(steam_id, verified);
+    if let Err(err) = linked {
+        set_status(ui, format!("No se pudo vincular la cuenta: {err}"));
+        return;
+    }
+    refresh_account_ui(ui, state);
+    refresh_games(ui, state);
+    let has_key = lock(&state.core)
+        .steam_account()
+        .map_or(false, |account| account.has_api_key);
+    if has_key {
+        set_status(ui, "Cuenta vinculada. Sincronizando tu biblioteca…");
+        start_account_sync(ui, state);
+    } else {
+        set_status(
+            ui,
+            "Cuenta vinculada. Para ver tu biblioteca, guarda tu clave de la Web API (botón «Conseguir clave»).",
+        );
+    }
+}
+
+/// Trae de Steam el nombre del perfil y la lista de juegos de la cuenta, en un hilo aparte.
+fn start_account_sync(ui: &MainWindow, state: &Arc<AppState>) {
+    let (account, key) = {
+        let core = lock(&state.core);
+        (core.steam_account(), core.api_key())
+    };
+    let Some(account) = account else {
+        set_status(ui, "Primero vincula una cuenta de Steam.");
+        return;
+    };
+    let Some(key) = key else {
+        ui.set_account_sync_status("Falta la clave de la Web API.".into());
+        return;
+    };
+    ui.set_account_busy(true);
+    ui.set_account_sync_status("Sincronizando tu biblioteca con Steam…".into());
+
+    let weak = ui.as_weak();
+    let state = state.clone();
+    std::thread::spawn(move || {
+        let work_dir = state.cache_dir.join("tmp");
+        let persona = steam_account::fetch_persona(&key, account.steam_id, &work_dir)
+            .ok()
+            .flatten();
+        let games = steam_account::fetch_owned_games(&key, account.steam_id, &work_dir);
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            ui.set_account_busy(false);
+            if let Some(name) = persona {
+                let _ = lock(&state.core).set_account_persona(&name);
+            }
+            match games {
+                Ok(list) if list.is_empty() => {
+                    // No se pisa lo que ya había: probablemente el perfil es privado.
+                    refresh_account_ui(&ui, &state);
+                    ui.set_account_sync_status(
+                        "Steam no devolvió ningún juego. Si tu perfil tiene los «Detalles de juego» en privado, Steam no entrega la lista: hazlos visibles y vuelve a sincronizar (o revisa tu clave)."
+                            .into(),
+                    );
+                }
+                Ok(list) => {
+                    let saved = lock(&state.core).save_owned_games(&list);
+                    match saved {
+                        Ok(()) => set_status(&ui, format!("Biblioteca sincronizada: {} juegos.", list.len())),
+                        Err(err) => set_status(&ui, format!("No se pudo guardar la biblioteca: {err}")),
+                    }
+                    refresh_account_ui(&ui, &state);
+                    refresh_games(&ui, &state);
+                }
+                Err(err) => {
+                    refresh_account_ui(&ui, &state);
+                    ui.set_account_sync_status(err.to_string().into());
+                }
+            }
+        });
+    });
+}
+
+/// Al arrancar: si hay cuenta con clave y la última sincronización tiene más de 12 horas, se repite.
+fn maybe_auto_sync_account(ui: &MainWindow, state: &Arc<AppState>) {
+    let due = {
+        let core = lock(&state.core);
+        match core.steam_account() {
+            Some(account) if account.has_api_key => match core.last_account_sync() {
+                Some(last) => unix_now() - last > 12 * 3600,
+                None => true,
+            },
+            _ => false,
+        }
+    };
+    if due {
+        start_account_sync(ui, state);
+    }
 }

@@ -190,6 +190,8 @@ mod tests {
                 install_path: PathBuf::from("C:\\a"),
                 launch_kind: LaunchKind::SteamUri,
                 launch_target: "220".into(),
+                steam_app_id: Some(220),
+                ..Default::default()
             }],
         )
         .unwrap();

@@ -50,6 +50,8 @@ impl SteamScan {
                 install_path: game.install_path.clone(),
                 launch_kind: LaunchKind::SteamUri,
                 launch_target: game.app_id.to_string(),
+                steam_app_id: Some(game.app_id),
+                ..Default::default()
             })
             .collect()
     }
@@ -169,6 +171,41 @@ fn push_unique(list: &mut Vec<PathBuf>, path: PathBuf) {
     if !list.iter().any(|p| path_key(p) == key) {
         list.push(path);
     }
+}
+
+/// Si `path` está dentro de `<biblioteca>\\steamapps\\common\\<carpeta>`, busca en el manifiesto de esa
+/// carpeta el AppID del juego. Así un juego instalado desde Steam y agregado a mano queda
+/// enlazado con su ficha sin preguntar nada.
+pub fn app_id_for_path(path: &Path) -> Option<u64> {
+    let components: Vec<Component<'_>> = path.components().collect();
+    let common_index = components.iter().enumerate().position(|(index, component)| {
+        index > 0
+            && component.as_os_str().eq_ignore_ascii_case("common")
+            && components[index - 1].as_os_str().eq_ignore_ascii_case("steamapps")
+    })?;
+    let steamapps: PathBuf = components[..common_index].iter().collect();
+    let folder = components
+        .get(common_index + 1)?
+        .as_os_str()
+        .to_string_lossy()
+        .to_lowercase();
+
+    for entry in fs::read_dir(&steamapps).ok()?.flatten() {
+        let file_name = entry.file_name().to_string_lossy().into_owned();
+        let lower = file_name.to_lowercase();
+        if !(lower.starts_with("appmanifest_") && lower.ends_with(".acf")) {
+            continue;
+        }
+        let Ok(bytes) = fs::read(entry.path()) else {
+            continue;
+        };
+        if let Ok(manifest) = parse_manifest(&String::from_utf8_lossy(&bytes), &file_name) {
+            if manifest.install_dir.to_lowercase() == folder {
+                return Some(manifest.app_id);
+            }
+        }
+    }
+    None
 }
 
 /// Analiza la carpeta de Steam elegida por el usuario (la raíz, `steamapps` o una biblioteca
@@ -393,6 +430,22 @@ mod tests {
         // Al terminar la instalación (StateFlags 4) aparece.
         fs::write(apps.join("appmanifest_220.acf"), ACF_HL2).unwrap();
         assert_eq!(scan_steam_folder(tmp.path()).unwrap().games.len(), 1);
+    }
+
+    #[test]
+    fn finds_the_app_id_of_a_game_by_its_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let apps = tmp.path().join("Biblioteca").join("SteamApps");
+        let game = apps.join("Common").join("Half-Life 2");
+        fs::create_dir_all(game.join("bin")).unwrap();
+        fs::write(apps.join("appmanifest_220.acf"), ACF_HL2).unwrap();
+
+        assert_eq!(app_id_for_path(&game.join("bin").join("hl2.exe")), Some(220));
+        assert_eq!(app_id_for_path(&game), Some(220));
+        // Fuera de steamapps\common no se asume nada.
+        assert_eq!(app_id_for_path(&tmp.path().join("Otros").join("x.exe")), None);
+        // Carpeta sin manifiesto.
+        assert_eq!(app_id_for_path(&apps.join("common").join("Desconocido").join("a.exe")), None);
     }
 
     #[test]

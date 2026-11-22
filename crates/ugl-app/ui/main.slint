@@ -12,6 +12,7 @@ export struct GameItem {
     icon: image,
     has-icon: bool,
     initial: string,
+    owned-only: bool,
 }
 
 export struct ExeItem {
@@ -35,6 +36,27 @@ export struct GameDetail {
     icon: image,
     has-icon: bool,
     initial: string,
+    cover: image,
+    has-cover: bool,
+    info: string,
+    description: string,
+    store-name: string,
+    can-use-store-name: bool,
+}
+
+export struct LinkResult {
+    name: string,
+    app-id: string,
+}
+
+export struct PreviewItem {
+    include: bool,
+    name: string,
+    path: string,
+    note: string,
+    status: string,
+    status-kind: int,
+    selectable: bool,
 }
 
 export struct AchievementItem {
@@ -139,7 +161,9 @@ component ImportCard inherits Rectangle {
     in property <string> description;
     in property <string> button-text;
     in property <bool> button-enabled: true;
+    in property <string> button2-text;
     callback activated();
+    callback activated2();
 
     background: #2a1f18;
     border-radius: 10px;
@@ -147,8 +171,8 @@ component ImportCard inherits Rectangle {
     border-color: #4a3626;
 
     VerticalLayout {
-        padding: 20px;
-        spacing: 10px;
+        padding: 14px;
+        spacing: 8px;
 
         Text {
             text: root.heading;
@@ -162,11 +186,19 @@ component ImportCard inherits Rectangle {
             font-size: 13px;
             wrap: word-wrap;
         }
-        Button {
-            text: root.button-text;
-            enabled: root.button-enabled;
-            primary: true;
-            clicked => { root.activated(); }
+        HorizontalLayout {
+            spacing: 8px;
+            Button {
+                text: root.button-text;
+                enabled: root.button-enabled;
+                primary: true;
+                clicked => { root.activated(); }
+            }
+            if root.button2-text != "" : Button {
+                text: root.button2-text;
+                enabled: root.button-enabled;
+                clicked => { root.activated2(); }
+            }
         }
     }
 }
@@ -177,7 +209,7 @@ export component MainWindow inherits Window {
     preferred-width: 1100px;
     preferred-height: 720px;
     min-width: 900px;
-    min-height: 600px;
+    min-height: 660px;
     background: #1c1511;
 
     // Estado general
@@ -202,6 +234,56 @@ export component MainWindow inherits Window {
     in property <string> scan-note;
 
     // Ficha del juego
+    // Vista previa de importación de ejecutables
+    in property <bool> preview-visible: false;
+    in property <[PreviewItem]> preview-items;
+    in property <string> preview-summary;
+    in property <int> preview-selected: 0;
+
+    // Cuenta de Steam (opcional)
+    in-out property <bool> show-owned: true;
+    in property <bool> account-linked: false;
+    in property <bool> account-has-key: false;
+    in property <bool> account-busy: false;
+    in property <string> account-status;
+    in property <string> account-login-url;
+    in property <string> account-key-status;
+    in property <string> account-sync-status;
+    in-out property <string> account-id-input;
+    in-out property <string> account-key-input;
+    // Juego de la cuenta que no está instalado
+    in property <bool> owned-dialog-visible: false;
+    in property <int> owned-app-id: 0;
+    in property <string> owned-title;
+    in property <string> owned-info;
+    in property <image> owned-cover;
+    in property <bool> owned-has-cover: false;
+
+    // Segundo plano y ficha de Steam Store
+    out property <image> app-icon: @image-url("../assets/ugl.png");
+    in-out property <bool> minimize-on-launch: true;
+    in-out property <bool> fetch-metadata: true;
+    in property <bool> link-dialog-visible: false;
+    in property <int> link-game-id: 0;
+    in property <string> link-game-title;
+    in-out property <string> link-query;
+    in property <[LinkResult]> link-results;
+    in-out property <int> link-selected: -1;
+    in property <string> link-status;
+    in property <bool> link-busy: false;
+
+    // Método de inicio de un juego
+    in property <bool> launch-dialog-visible: false;
+    in property <int> launch-game-id: 0;
+    in property <string> launch-game-title;
+    in-out property <int> launch-method: 0;
+    in-out property <string> launch-exe;
+    in-out property <string> launch-args;
+    in-out property <string> launch-workdir;
+    in-out property <string> launch-steam-id;
+    in-out property <string> launch-uri;
+    in property <string> launch-error;
+
     in property <bool> detail-visible: false;
     in property <GameDetail> detail;
     in-out property <bool> confirm-remove: false;
@@ -220,6 +302,36 @@ export component MainWindow inherits Window {
     callback change-path-clicked(int);
     callback remove-clicked(int);
     callback achievements-clicked(int);
+    callback import-exes-clicked();
+    callback import-shortcuts-clicked();
+    callback preview-toggled(int, bool);
+    callback preview-name-edited(int, string);
+    callback preview-confirm();
+    callback preview-cancel();
+    callback launch-settings-clicked(int);
+    callback launch-browse-exe();
+    callback launch-browse-workdir();
+    callback launch-save(int);
+    callback launch-cancel();
+    callback account-login-clicked();
+    callback account-cancel-clicked();
+    callback account-unlink-clicked();
+    callback account-link-manual(string);
+    callback account-save-key(string);
+    callback account-open-key-page();
+    callback account-sync-clicked();
+    callback show-owned-toggled(bool);
+    callback owned-clicked(int);
+    callback owned-store(int);
+    callback owned-close();
+    callback minimize-to-tray-clicked();
+    callback minimize-on-launch-toggled(bool);
+    callback fetch-metadata-toggled(bool);
+    callback use-store-name-clicked(int);
+    callback steam-link-clicked(int);
+    callback steam-link-search(string);
+    callback steam-link-confirm(int);
+    callback steam-link-cancel();
     callback auto-update-toggled(bool);
     callback download-icons-toggled(bool);
 
@@ -232,7 +344,6 @@ export component MainWindow inherits Window {
             VerticalLayout {
                 padding: 16px;
                 spacing: 6px;
-                alignment: start;
 
                 Text {
                     text: "UGL";
@@ -257,9 +368,19 @@ export component MainWindow inherits Window {
                     clicked => { root.current-view = 1; }
                 }
                 NavButton {
+                    label: "Cuenta de Steam";
+                    selected: root.current-view == 3;
+                    clicked => { root.current-view = 3; }
+                }
+                NavButton {
                     label: "Ajustes";
                     selected: root.current-view == 2;
                     clicked => { root.current-view = 2; }
+                }
+                Rectangle { vertical-stretch: 1; }
+                Button {
+                    text: "Minimizar a la bandeja";
+                    clicked => { root.minimize-to-tray-clicked(); }
                 }
             }
         }
@@ -286,6 +407,11 @@ export component MainWindow inherits Window {
                         current-index: root.sort-index;
                         selected(value) => { root.sort-changed(self.current-index); }
                     }
+                    if root.account-linked : CheckBox {
+                        text: "Mostrar no instalados";
+                        checked <=> root.show-owned;
+                        toggled => { root.show-owned-toggled(self.checked); }
+                    }
                 }
 
                 if root.games.length == 0 : Rectangle {
@@ -310,7 +436,13 @@ export component MainWindow inherits Window {
                         background: row-area.has-hover ? #2f2218 : transparent;
 
                         row-area := TouchArea {
-                            clicked => { root.game-clicked(game.id); }
+                            clicked => {
+                                if (game.owned-only) {
+                                    root.owned-clicked(game.id);
+                                } else {
+                                    root.game-clicked(game.id);
+                                }
+                            }
                         }
 
                         HorizontalLayout {
@@ -348,7 +480,7 @@ export component MainWindow inherits Window {
                                     clicked => { root.achievements-clicked(game.id); }
                                 }
                             }
-                            Button {
+                            if !game.owned-only : Button {
                                 text: "Jugar";
                                 primary: true;
                                 width: 90px;
@@ -378,7 +510,7 @@ export component MainWindow inherits Window {
                     wrap: word-wrap;
                 }
                 ImportCard {
-                    height: 170px;
+                    height: 140px;
                     heading: "Importar juego individual";
                     description: "Elige la carpeta donde está instalado el juego. UGL buscará los ejecutables y te dejará elegir cuál usar para iniciarlo.";
                     button-text: "Elegir carpeta del juego…";
@@ -386,7 +518,17 @@ export component MainWindow inherits Window {
                     activated => { root.import-folder-clicked(); }
                 }
                 ImportCard {
-                    height: 170px;
+                    height: 140px;
+                    heading: "Importar ejecutables";
+                    description: "Elige uno o varios .exe a la vez: cada uno será un juego independiente, aunque estén en la misma carpeta. Verás una vista previa y se evitan los duplicados. Un acceso directo (.lnk) se resuelve a su ejecutable real, con sus argumentos.";
+                    button-text: "Elegir ejecutables…";
+                    button2-text: "Desde una carpeta de accesos directos…";
+                    button-enabled: !root.busy;
+                    activated => { root.import-exes-clicked(); }
+                    activated2 => { root.import-shortcuts-clicked(); }
+                }
+                ImportCard {
+                    height: 140px;
                     heading: "Importar carpeta de Steam";
                     description: "Selecciona tu carpeta de Steam (o una biblioteca adicional). UGL lee los archivos locales appmanifest y libraryfolders.vdf: no necesita iniciar sesión ni conexión.";
                     button-text: "Elegir carpeta de Steam…";
@@ -454,10 +596,170 @@ export component MainWindow inherits Window {
                     toggled => { root.download-icons-toggled(self.checked); }
                 }
                 Text {
-                    text: "Es la única función de UGL que usa internet: pide a los servidores de imágenes de Steam solo el icono de cada logro (por AppID y código de imagen) y lo guarda en tu equipo. Desactívala y UGL funcionará sin conexión con las imágenes que ya existan.";
+                    text: "Usa internet: pide a los servidores de imágenes de Steam solo el icono de cada logro (por AppID y código de imagen) y lo guarda en tu equipo. Desactívala y UGL funcionará sin conexión con las imágenes que ya existan.";
                     color: #8a7662;
                     font-size: 12px;
                     wrap: word-wrap;
+                }
+                CheckBox {
+                    text: "Descargar la ficha pública de Steam Store (nombre, descripción y portada)";
+                    checked <=> root.fetch-metadata;
+                    toggled => { root.fetch-metadata-toggled(self.checked); }
+                }
+                Text {
+                    text: "Usa internet y no necesita Steam instalado ni tu cuenta: consulta la tienda pública solo con el AppID de cada juego y guarda el resultado en tu equipo para funcionar sin conexión.";
+                    color: #8a7662;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                CheckBox {
+                    text: "Minimizar UGL a la bandeja al iniciar un juego";
+                    checked <=> root.minimize-on-launch;
+                    toggled => { root.minimize-on-launch-toggled(self.checked); }
+                }
+                Text {
+                    text: "UGL se oculta en la bandeja del sistema mientras juegas y vuelve a mostrarse al cerrar el juego. Puedes abrirlo o salir desde su icono de la bandeja.";
+                    color: #8a7662;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+
+            // ---- Cuenta de Steam ----
+            if root.current-view == 3 : VerticalLayout {
+                vertical-stretch: 1;
+                spacing: 8px;
+                alignment: start;
+
+                Text {
+                    text: "Cuenta de Steam";
+                    color: #f2e6d4;
+                    font-size: 24px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: "Es opcional: UGL funciona igual sin ella. Al vincularla, tu biblioteca de Steam aparece en UGL aunque los juegos no estén instalados en este equipo.";
+                    color: #b9a58e;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: root.account-status;
+                    color: #e8b96a;
+                    font-size: 13px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: "Iniciar sesión con Steam";
+                        primary: true;
+                        enabled: !root.account-busy;
+                        clicked => { root.account-login-clicked(); }
+                    }
+                    if root.account-busy : Button {
+                        text: "Cancelar";
+                        clicked => { root.account-cancel-clicked(); }
+                    }
+                    if root.account-linked : Button {
+                        text: "Desvincular cuenta";
+                        enabled: !root.account-busy;
+                        clicked => { root.account-unlink-clicked(); }
+                    }
+                }
+                if root.account-login-url != "" : VerticalLayout {
+                    spacing: 4px;
+
+                    Text {
+                        text: "Si el navegador no se abrió, copia esta dirección y pégala en su barra de direcciones (UGL sigue esperando):";
+                        color: #b9a58e;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                    LineEdit {
+                        text: root.account-login-url;
+                        read-only: true;
+                    }
+                }
+                Text {
+                    text: "El inicio de sesión se hace en tu navegador, en la página oficial de Steam. UGL nunca ve tu usuario ni tu contraseña: solo recibe tu SteamID.";
+                    color: #8a7662;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        text <=> root.account-id-input;
+                        placeholder-text: "…o escribe tu SteamID64 o la dirección de tu perfil";
+                        accepted => { root.account-link-manual(root.account-id-input); }
+                    }
+                    Button {
+                        text: "Vincular";
+                        enabled: !root.account-busy;
+                        clicked => { root.account-link-manual(root.account-id-input); }
+                    }
+                }
+
+                Rectangle { height: 6px; }
+                Text {
+                    text: "Clave de la Web API de Steam";
+                    color: #f2e6d4;
+                    font-size: 15px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.account-key-status;
+                    color: #e8b96a;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        text <=> root.account-key-input;
+                        input-type: InputType.password;
+                        placeholder-text: "Pega aquí tu clave (32 caracteres)";
+                        accepted => { root.account-save-key(root.account-key-input); }
+                    }
+                    Button {
+                        text: "Guardar clave";
+                        enabled: !root.account-busy;
+                        clicked => { root.account-save-key(root.account-key-input); }
+                    }
+                    Button {
+                        text: "Conseguir clave";
+                        clicked => { root.account-open-key-page(); }
+                    }
+                }
+                Text {
+                    text: "Steam solo entrega la lista de juegos de una cuenta a quien tiene una clave de su API. Cada persona genera la suya, gratis, en la página de Steam (se abre con «Conseguir clave»; en el campo de dominio puedes escribir cualquier texto, por ejemplo «localhost»). La clave es personal: UGL la guarda cifrada con tu usuario de Windows y solo la usa para consultar tu biblioteca. Además, tu perfil debe tener los «Detalles de juego» visibles; las cuentas limitadas no pueden obtener clave.";
+                    color: #8a7662;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Button {
+                        text: "Sincronizar biblioteca";
+                        primary: true;
+                        enabled: root.account-linked && root.account-has-key && !root.account-busy;
+                        clicked => { root.account-sync-clicked(); }
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: root.account-sync-status;
+                        color: #b9a58e;
+                        font-size: 12px;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                    }
+                }
+                CheckBox {
+                    text: "Mostrar en la biblioteca los juegos de mi cuenta que no están instalados";
+                    checked <=> root.show-owned;
+                    toggled => { root.show-owned-toggled(self.checked); }
                 }
             }
 
@@ -586,6 +888,107 @@ export component MainWindow inherits Window {
         }
     }
 
+    // ---- Vista previa de importación de ejecutables ----
+    if root.preview-visible : Rectangle {
+        background: #000000c0;
+
+        TouchArea { }
+
+        Rectangle {
+            width: Math.min(860px, parent.width - 48px);
+            height: Math.min(640px, parent.height - 48px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #2a1f18;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #4a3626;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+
+                Text {
+                    text: "Vista previa de la importación";
+                    color: #f2e6d4;
+                    font-size: 20px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.preview-summary;
+                    color: #b9a58e;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for item[i] in root.preview-items : Rectangle {
+                        height: 78px;
+                        border-radius: 6px;
+                        background: item.status-kind == 0 ? #2f2218 : #221813;
+
+                        HorizontalLayout {
+                            padding: 10px;
+                            spacing: 12px;
+
+                            CheckBox {
+                                enabled: item.selectable;
+                                checked: item.include;
+                                toggled => { root.preview-toggled(i, self.checked); }
+                            }
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                spacing: 3px;
+
+                                LineEdit {
+                                    text: item.name;
+                                    enabled: item.selectable;
+                                    edited(value) => { root.preview-name-edited(i, value); }
+                                }
+                                Text {
+                                    text: item.path;
+                                    color: #8a7662;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: item.note;
+                                    color: item.status-kind == 2 ? #d9825b : #b9a58e;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+                            Text {
+                                width: 96px;
+                                text: item.status;
+                                color: item.status-kind == 0 ? #7fc15b : (item.status-kind == 1 ? #c98a3b : #d9825b);
+                                font-size: 12px;
+                                font-weight: 700;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cancelar";
+                        clicked => { root.preview-cancel(); }
+                    }
+                    Button {
+                        text: "Importar " + root.preview-selected + " juego(s)";
+                        primary: true;
+                        enabled: root.preview-selected > 0;
+                        clicked => { root.preview-confirm(); }
+                    }
+                }
+            }
+        }
+    }
+
     // ---- Ficha del juego ----
     if root.detail-visible : Rectangle {
         background: #000000c0;
@@ -594,7 +997,7 @@ export component MainWindow inherits Window {
 
         Rectangle {
             width: Math.min(680px, parent.width - 48px);
-            height: Math.min(440px, parent.height - 48px);
+            height: Math.min(600px, parent.height - 48px);
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: #2a1f18;
@@ -623,6 +1026,51 @@ export component MainWindow inherits Window {
                         font-weight: 700;
                         wrap: word-wrap;
                         vertical-alignment: center;
+                    }
+                }
+                if root.detail.has-cover || root.detail.info != "" || root.detail.description != "" : HorizontalLayout {
+                    spacing: 14px;
+
+                    if root.detail.has-cover : Rectangle {
+                        width: 96px;
+                        height: 144px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #4a3626;
+                        clip: true;
+
+                        Image {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: parent.height;
+                            source: root.detail.cover;
+                            image-fit: cover;
+                        }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 4px;
+                        alignment: start;
+
+                        if root.detail.info != "" : Text {
+                            text: root.detail.info;
+                            color: #e8b96a;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        if root.detail.description != "" : Text {
+                            text: root.detail.description;
+                            color: #b9a58e;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                            overflow: elide;
+                            max-height: 100px;
+                        }
+                        if root.detail.can-use-store-name : Button {
+                            text: "Usar el nombre de Steam: " + root.detail.store-name;
+                            clicked => { root.use-store-name-clicked(root.detail.id); }
+                        }
                     }
                 }
                 Text {
@@ -683,6 +1131,14 @@ export component MainWindow inherits Window {
                         text: "Quitar de la biblioteca";
                         clicked => { root.confirm-remove = true; }
                     }
+                    if !root.confirm-remove : Button {
+                        text: "Método de inicio…";
+                        clicked => { root.launch-settings-clicked(root.detail.id); }
+                    }
+                    if !root.confirm-remove : Button {
+                        text: "Asociar con Steam…";
+                        clicked => { root.steam-link-clicked(root.detail.id); }
+                    }
                     if root.confirm-remove : Button {
                         text: "Sí, quitar";
                         clicked => { root.remove-clicked(root.detail.id); }
@@ -695,6 +1151,318 @@ export component MainWindow inherits Window {
                     Button {
                         text: "Cerrar";
                         clicked => { root.detail-close(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Método de inicio de un juego ----
+    if root.launch-dialog-visible : Rectangle {
+        background: #000000c0;
+
+        TouchArea { }
+
+        Rectangle {
+            width: Math.min(680px, parent.width - 48px);
+            height: Math.min(520px, parent.height - 48px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #2a1f18;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #4a3626;
+
+            VerticalLayout {
+                padding: 22px;
+                spacing: 8px;
+
+                Text {
+                    text: "Método de inicio";
+                    color: #f2e6d4;
+                    font-size: 20px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.launch-game-title;
+                    color: #8a7662;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+                ComboBox {
+                    model: ["Ejecutable directo (.exe)", "Steam", "Otra plataforma (dirección)"];
+                    current-index <=> root.launch-method;
+                }
+
+                if root.launch-method == 0 : VerticalLayout {
+                    spacing: 6px;
+
+                    Text { text: "Ejecutable"; color: #b9a58e; font-size: 12px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        LineEdit {
+                            text <=> root.launch-exe;
+                            placeholder-text: "Ruta del .exe";
+                        }
+                        Button {
+                            text: "Elegir…";
+                            clicked => { root.launch-browse-exe(); }
+                        }
+                    }
+                    Text { text: "Argumentos"; color: #b9a58e; font-size: 12px; }
+                    LineEdit {
+                        text <=> root.launch-args;
+                        placeholder-text: "-windowed -nolauncher";
+                    }
+                    Text { text: "Directorio de trabajo (vacío = carpeta del ejecutable)"; color: #b9a58e; font-size: 12px; }
+                    HorizontalLayout {
+                        spacing: 8px;
+                        LineEdit {
+                            text <=> root.launch-workdir;
+                            placeholder-text: "Opcional";
+                        }
+                        Button {
+                            text: "Elegir…";
+                            clicked => { root.launch-browse-workdir(); }
+                        }
+                    }
+                }
+                if root.launch-method == 1 : VerticalLayout {
+                    spacing: 6px;
+
+                    Text { text: "AppID de Steam"; color: #b9a58e; font-size: 12px; }
+                    LineEdit {
+                        text <=> root.launch-steam-id;
+                        placeholder-text: "Por ejemplo, 220";
+                    }
+                    Text {
+                        text: "El juego se inicia con steam://rungameid/<AppID> y Steam se encarga del resto. El ejecutable que ya se conoce se conserva por si quieres volver al inicio directo.";
+                        color: #8a7662;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+                if root.launch-method == 2 : VerticalLayout {
+                    spacing: 6px;
+
+                    Text { text: "Dirección de la plataforma"; color: #b9a58e; font-size: 12px; }
+                    LineEdit {
+                        text <=> root.launch-uri;
+                        placeholder-text: "goggalaxy://openGameView/123";
+                    }
+                    Text {
+                        text: "Esquemas admitidos: steam, com.epicgames.launcher, goggalaxy, itch, uplay, origin2 y battlenet.";
+                        color: #8a7662;
+                        font-size: 11px;
+                        wrap: word-wrap;
+                    }
+                }
+
+                Rectangle { vertical-stretch: 1; }
+                Text {
+                    text: root.launch-error;
+                    visible: root.launch-error != "";
+                    color: #d9825b;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cancelar";
+                        clicked => { root.launch-cancel(); }
+                    }
+                    Button {
+                        text: "Guardar";
+                        primary: true;
+                        clicked => { root.launch-save(root.launch-game-id); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Asociar con una ficha de Steam ----
+    if root.link-dialog-visible : Rectangle {
+        background: #000000c0;
+
+        TouchArea { }
+
+        Rectangle {
+            width: Math.min(640px, parent.width - 48px);
+            height: Math.min(520px, parent.height - 48px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #2a1f18;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #4a3626;
+
+            VerticalLayout {
+                padding: 22px;
+                spacing: 8px;
+
+                Text {
+                    text: "Asociar con una ficha de Steam";
+                    color: #f2e6d4;
+                    font-size: 20px;
+                    font-weight: 700;
+                }
+                Text {
+                    text: root.link-game-title;
+                    color: #8a7662;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    LineEdit {
+                        text <=> root.link-query;
+                        placeholder-text: "Nombre del juego o AppID";
+                        accepted => { root.steam-link-search(root.link-query); }
+                    }
+                    Button {
+                        text: "Buscar";
+                        enabled: !root.link-busy;
+                        clicked => { root.steam-link-search(root.link-query); }
+                    }
+                }
+                ListView {
+                    vertical-stretch: 1;
+                    for result[i] in root.link-results : Rectangle {
+                        height: 44px;
+                        border-radius: 6px;
+                        background: root.link-selected == i ? #4a3626 : (result-area.has-hover ? #36281d : transparent);
+
+                        result-area := TouchArea {
+                            clicked => { root.link-selected = i; }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: 10px;
+
+                            Text {
+                                horizontal-stretch: 1;
+                                text: result.name;
+                                color: #f2e6d4;
+                                font-size: 13px;
+                                vertical-alignment: center;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: "AppID " + result.app-id;
+                                color: #8a7662;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
+                }
+                Text {
+                    text: root.link-status;
+                    color: #c98a3b;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cancelar";
+                        clicked => { root.steam-link-cancel(); }
+                    }
+                    Button {
+                        text: "Asociar";
+                        primary: true;
+                        enabled: root.link-selected >= 0 && !root.link-busy;
+                        clicked => { root.steam-link-confirm(root.link-game-id); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Juego de la cuenta que no está instalado ----
+    if root.owned-dialog-visible : Rectangle {
+        background: #000000c0;
+
+        TouchArea { }
+
+        Rectangle {
+            width: Math.min(560px, parent.width - 48px);
+            height: Math.min(380px, parent.height - 48px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #2a1f18;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #4a3626;
+
+            VerticalLayout {
+                padding: 22px;
+                spacing: 10px;
+
+                HorizontalLayout {
+                    spacing: 16px;
+
+                    if root.owned-has-cover : Rectangle {
+                        width: 110px;
+                        height: 165px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #4a3626;
+                        clip: true;
+
+                        Image {
+                            x: 0px;
+                            y: 0px;
+                            width: parent.width;
+                            height: parent.height;
+                            source: root.owned-cover;
+                            image-fit: cover;
+                        }
+                    }
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 6px;
+                        alignment: start;
+
+                        Text {
+                            text: root.owned-title;
+                            color: #f2e6d4;
+                            font-size: 22px;
+                            font-weight: 700;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: "Está en tu cuenta de Steam, pero no instalado en este equipo.";
+                            color: #c98a3b;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.owned-info;
+                            color: #b9a58e;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                Rectangle { vertical-stretch: 1; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    Button {
+                        text: "Ver en la tienda";
+                        primary: true;
+                        clicked => { root.owned-store(root.owned-app-id); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button {
+                        text: "Cerrar";
+                        clicked => { root.owned-close(); }
                     }
                 }
             }

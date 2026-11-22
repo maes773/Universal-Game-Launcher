@@ -5,12 +5,16 @@ use std::path::{Path, PathBuf};
 pub type GameId = i64;
 
 /// Cómo se inicia un juego.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LaunchKind {
-    /// Ejecutable propio; `launch_target` es la ruta relativa a la carpeta de instalación.
+    /// Ejecutable propio; `launch_target` es la ruta del .exe (relativa a la carpeta de instalación
+    /// o absoluta).
+    #[default]
     Executable,
     /// A través de Steam; `launch_target` es el AppID.
     SteamUri,
+    /// A través de otra plataforma; `launch_target` es una URI de una lista de esquemas permitidos.
+    Uri,
 }
 
 impl LaunchKind {
@@ -18,6 +22,7 @@ impl LaunchKind {
         match self {
             LaunchKind::Executable => "executable",
             LaunchKind::SteamUri => "steam_uri",
+            LaunchKind::Uri => "uri",
         }
     }
 
@@ -25,7 +30,25 @@ impl LaunchKind {
         match value {
             "executable" => Some(LaunchKind::Executable),
             "steam_uri" => Some(LaunchKind::SteamUri),
+            "uri" => Some(LaunchKind::Uri),
             _ => None,
+        }
+    }
+
+    /// Posición en el desplegable de la interfaz.
+    pub fn index(self) -> i32 {
+        match self {
+            LaunchKind::Executable => 0,
+            LaunchKind::SteamUri => 1,
+            LaunchKind::Uri => 2,
+        }
+    }
+
+    pub fn from_index(index: i32) -> Self {
+        match index {
+            1 => LaunchKind::SteamUri,
+            2 => LaunchKind::Uri,
+            _ => LaunchKind::Executable,
         }
     }
 }
@@ -91,11 +114,19 @@ pub struct Game {
     pub achievements_unlocked: u32,
     /// None = sin intentar; Some("") = sin icono; Some(ruta) = PNG en la caché.
     pub icon_path: Option<String>,
+    /// Ejecutable directo conocido (relativo a `install_path` o absoluto), aunque el juego se
+    /// inicie por Steam.
+    pub exe_path: Option<String>,
+    pub launch_args: String,
+    /// Directorio de trabajo; `None` = carpeta del ejecutable.
+    pub working_dir: Option<String>,
+    /// AppID de Steam conocido, aunque el juego se inicie con su ejecutable.
+    pub steam_app_id: Option<u64>,
 }
 
 /// Lo que una integración entrega al registro. Es el único contrato entre
 /// los proveedores (manual, Steam, futuros) y el núcleo.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DiscoveredGame {
     pub provider: String,
     /// Identificador estable dentro del proveedor (AppID de Steam, ruta normalizada…).
@@ -105,6 +136,47 @@ pub struct DiscoveredGame {
     pub install_path: PathBuf,
     pub launch_kind: LaunchKind,
     pub launch_target: String,
+    pub exe_path: Option<String>,
+    pub launch_args: String,
+    pub working_dir: Option<String>,
+    pub steam_app_id: Option<u64>,
+}
+
+/// Cambios pedidos al método de lanzamiento de un juego (los valida `Core::update_launch`).
+#[derive(Debug, Clone, Default)]
+pub struct LaunchSettings {
+    pub kind: LaunchKind,
+    /// Ejecutable elegido; `None` = conservar el que ya se conoce.
+    pub exe: Option<PathBuf>,
+    pub args: String,
+    pub working_dir: Option<PathBuf>,
+    pub steam_app_id: Option<u64>,
+    pub uri: Option<String>,
+}
+
+/// Ficha de la tienda guardada en local para un juego.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MetadataRecord {
+    pub steam_app_id: u64,
+    /// `false` = Steam no ofrece ficha para ese AppID.
+    pub available: bool,
+    pub name: String,
+    pub short_description: String,
+    pub developers: Vec<String>,
+    pub publishers: Vec<String>,
+    pub genres: Vec<String>,
+    pub release_date: String,
+    pub website: Option<String>,
+    pub cover_path: Option<String>,
+}
+
+/// Juego de la biblioteca de la cuenta de Steam vinculada (esté o no instalado).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedGame {
+    pub app_id: u64,
+    pub name: String,
+    pub playtime_minutes: u64,
+    pub last_played_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -163,7 +235,8 @@ pub fn format_date(unix: i64) -> String {
 pub fn path_key(path: &Path) -> String {
     path.to_string_lossy()
         .to_lowercase()
-        .trim_end_matches(|c| c == '\\' || c == '/')
+        .replace('/', "\\")
+        .trim_end_matches('\\')
         .to_string()
 }
 
@@ -180,9 +253,26 @@ mod tests {
     }
 
     #[test]
+    fn path_key_treats_both_separators_alike() {
+        assert_eq!(
+            path_key(Path::new("D:\\Juegos/Doom\\bin/doom.exe")),
+            path_key(Path::new("d:\\juegos\\doom\\bin\\doom.exe"))
+        );
+    }
+
+    #[test]
     fn formats_unix_dates() {
         assert_eq!(format_date(0), "01/01/1970");
         assert_eq!(format_date(1_700_000_000), "14/11/2023");
+    }
+
+    #[test]
+    fn launch_kind_roundtrip() {
+        for kind in [LaunchKind::Executable, LaunchKind::SteamUri, LaunchKind::Uri] {
+            assert_eq!(LaunchKind::parse(kind.as_str()), Some(kind));
+            assert_eq!(LaunchKind::from_index(kind.index()), kind);
+        }
+        assert_eq!(LaunchKind::parse("lnk"), None);
     }
 
     #[test]

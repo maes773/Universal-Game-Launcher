@@ -11,6 +11,54 @@ pub fn looks_like_image(bytes: &[u8]) -> bool {
     bytes.starts_with(&[0xFF, 0xD8, 0xFF]) || bytes.starts_with(&[0x89, b'P', b'N', b'G'])
 }
 
+/// Descarga cuya dirección lleva un secreto (la clave de la API): al terminar se borra la entrada de la
+/// caché de internet de Windows para no dejar la clave en disco.
+pub fn download_private(url: &str, dest: &Path) -> Result<()> {
+    let result = download_file(url, dest);
+    platform::forget_cached(url);
+    result
+}
+
+/// Envía un formulario por POST con `curl` (incluido en Windows 10 y 11) y devuelve la respuesta.
+/// Los argumentos se pasan sin intérprete de comandos.
+pub fn post_form(url: &str, body: &str) -> Result<String> {
+    use std::process::Command;
+    #[cfg(windows)]
+    const CURL: &str = "curl.exe";
+    #[cfg(not(windows))]
+    const CURL: &str = "curl";
+
+    if !url.starts_with("https://") || body.starts_with('@') {
+        return Err(UglError::Invalid("Petición no permitida.".into()));
+    }
+    let mut command = Command::new(CURL);
+    command.args(["--silent", "--show-error", "--max-time", "20", "--data", body, url]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x0800_0000); // sin ventana de consola
+    }
+    let output = command
+        .output()
+        .map_err(|err| UglError::Invalid(format!("No se pudo ejecutar curl: {err}")))?;
+    if !output.status.success() {
+        return Err(UglError::Invalid(format!("curl terminó con error ({}).", output.status)));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Descarga `url` en `dest` (escritura atómica) sin interpretar el contenido (JSON, etc.).
+pub fn download_file(url: &str, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let part = dest.with_extension("part");
+    let _ = fs::remove_file(&part);
+    platform::download(url, &part)?;
+    fs::rename(&part, dest)?;
+    Ok(())
+}
+
 /// Descarga `url` en `dest` (escritura atómica) y comprueba que sea una imagen.
 pub fn download_image(url: &str, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
@@ -53,6 +101,19 @@ mod platform {
         ) -> i32;
     }
 
+    #[link(name = "wininet")]
+    extern "system" {
+        fn DeleteUrlCacheEntryW(url: *const u16) -> i32;
+    }
+
+    pub fn forget_cached(url: &str) {
+        let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+        // SAFETY: cadena terminada en cero que vive durante la llamada; si no hay entrada, no pasa nada.
+        unsafe {
+            DeleteUrlCacheEntryW(wide.as_ptr());
+        }
+    }
+
     pub fn download(url: &str, dest: &Path) -> Result<()> {
         let wide_url: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
         let wide_file: Vec<u16> = dest
@@ -86,6 +147,8 @@ mod platform {
     use std::path::Path;
 
     use crate::error::{Result, UglError};
+
+    pub fn forget_cached(_url: &str) {}
 
     pub fn download(_url: &str, _dest: &Path) -> Result<()> {
         Err(UglError::Invalid(
