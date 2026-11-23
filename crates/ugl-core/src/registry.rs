@@ -242,7 +242,11 @@ pub fn save_metadata(conn: &Connection, game_id: GameId, record: &MetadataRecord
         params![
             game_id,
             record.steam_app_id as i64,
-            if record.available { "ok" } else { "unavailable" },
+            if record.available {
+                "ok"
+            } else {
+                "unavailable"
+            },
             record.name,
             record.short_description,
             join_list(&record.developers),
@@ -284,7 +288,10 @@ pub fn get_metadata(conn: &Connection, game_id: GameId) -> Result<Option<Metadat
 }
 
 pub fn delete_metadata(conn: &Connection, game_id: GameId) -> Result<()> {
-    conn.execute("DELETE FROM game_metadata WHERE game_id = ?1", params![game_id])?;
+    conn.execute(
+        "DELETE FROM game_metadata WHERE game_id = ?1",
+        params![game_id],
+    )?;
     Ok(())
 }
 
@@ -378,7 +385,9 @@ pub fn clear_account_games(conn: &Connection) -> Result<()> {
 /// Juegos de la cuenta que no están en la biblioteca local (los «no instalados»).
 pub fn list_owned_only(conn: &Connection, query: &str, order: SortOrder) -> Result<Vec<OwnedGame>> {
     let order_by = match order {
-        SortOrder::RecentlyPlayed => "a.last_played_at IS NULL, a.last_played_at DESC, lower(a.name) ASC",
+        SortOrder::RecentlyPlayed => {
+            "a.last_played_at IS NULL, a.last_played_at DESC, lower(a.name) ASC"
+        }
         _ => "lower(a.name) ASC",
     };
     let sql = format!(
@@ -403,7 +412,9 @@ pub fn list_owned_only(conn: &Connection, query: &str, order: SortOrder) -> Resu
 
 /// (total en la cuenta, de ellos sin instalar).
 pub fn count_account_games(conn: &Connection) -> Result<(usize, usize)> {
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM account_games", params![], |r| r.get(0))?;
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM account_games", params![], |r| {
+        r.get(0)
+    })?;
     let not_installed: i64 = conn.query_row(
         &format!("SELECT COUNT(*) FROM account_games a WHERE {OWNED_ONLY}"),
         params![],
@@ -466,14 +477,16 @@ pub fn set_icon_path(conn: &Connection, id: GameId, path: &str) -> Result<()> {
 
 /// Olvida el icono para que se vuelva a extraer (por ejemplo, tras cambiar el ejecutable).
 pub fn clear_icon(conn: &Connection, id: GameId) -> Result<()> {
-    conn.execute("UPDATE games SET icon_path = NULL WHERE id = ?1", params![id])?;
+    conn.execute(
+        "UPDATE games SET icon_path = NULL WHERE id = ?1",
+        params![id],
+    )?;
     Ok(())
 }
 
 pub fn games_without_icon(conn: &Connection, limit: usize) -> Result<Vec<Game>> {
-    let sql = format!(
-        "{GAME_SELECT} WHERE g.hidden = 0 AND g.icon_path IS NULL ORDER BY g.id LIMIT ?1"
-    );
+    let sql =
+        format!("{GAME_SELECT} WHERE g.hidden = 0 AND g.icon_path IS NULL ORDER BY g.id LIMIT ?1");
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params![limit as i64], map_game)?;
     let games = rows.collect::<rusqlite::Result<Vec<Game>>>()?;
@@ -548,7 +561,9 @@ mod tests {
         .unwrap();
         assert_eq!(summary.updated, 1);
 
-        let game = list_games(db.conn(), "", SortOrder::Title).unwrap().remove(0);
+        let game = list_games(db.conn(), "", SortOrder::Title)
+            .unwrap()
+            .remove(0);
         assert_eq!(game.install_path, PathBuf::from("D:\\Lib\\common\\HL2"));
     }
 
@@ -577,7 +592,9 @@ mod tests {
 
         let installs: i64 = db
             .conn()
-            .query_row("SELECT COUNT(*) FROM installations", params![], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM installations", params![], |r| {
+                r.get(0)
+            })
             .unwrap();
         let sources: i64 = db
             .conn()
@@ -596,7 +613,10 @@ mod tests {
         assert_eq!(games_without_icon(db.conn(), 10).unwrap().len(), 1);
         set_icon_path(db.conn(), id, "").unwrap(); // se intentó y no hay icono
         assert!(games_without_icon(db.conn(), 10).unwrap().is_empty());
-        assert_eq!(get_game(db.conn(), id).unwrap().icon_path.as_deref(), Some(""));
+        assert_eq!(
+            get_game(db.conn(), id).unwrap().icon_path.as_deref(),
+            Some("")
+        );
 
         clear_icon(db.conn(), id).unwrap();
         assert_eq!(games_without_icon(db.conn(), 10).unwrap().len(), 1);
@@ -606,8 +626,12 @@ mod tests {
     fn finds_a_game_by_its_source() {
         let mut db = Database::open_in_memory().unwrap();
         register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
-        assert!(find_game_by_source(db.conn(), "steam", "220").unwrap().is_some());
-        assert!(find_game_by_source(db.conn(), "steam", "999").unwrap().is_none());
+        assert!(find_game_by_source(db.conn(), "steam", "220")
+            .unwrap()
+            .is_some());
+        assert!(find_game_by_source(db.conn(), "steam", "999")
+            .unwrap()
+            .is_none());
     }
 
     fn sample_record(app_id: u64) -> MetadataRecord {
@@ -631,14 +655,23 @@ mod tests {
         register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
         let id = list_games(db.conn(), "", SortOrder::Title).unwrap()[0].id;
 
-        assert_eq!(games_needing_metadata(db.conn(), 10).unwrap(), vec![(id, 220)]);
+        assert_eq!(
+            games_needing_metadata(db.conn(), 10).unwrap(),
+            vec![(id, 220)]
+        );
         save_metadata(db.conn(), id, &sample_record(220)).unwrap();
         assert!(games_needing_metadata(db.conn(), 10).unwrap().is_empty());
-        assert_eq!(get_metadata(db.conn(), id).unwrap(), Some(sample_record(220)));
+        assert_eq!(
+            get_metadata(db.conn(), id).unwrap(),
+            Some(sample_record(220))
+        );
 
         // Cambiar la asociación manualmente obliga a pedir la ficha nueva.
         set_steam_app_id(db.conn(), id, Some(70)).unwrap();
-        assert_eq!(games_needing_metadata(db.conn(), 10).unwrap(), vec![(id, 70)]);
+        assert_eq!(
+            games_needing_metadata(db.conn(), 10).unwrap(),
+            vec![(id, 70)]
+        );
         delete_metadata(db.conn(), id).unwrap();
         assert!(get_metadata(db.conn(), id).unwrap().is_none());
     }
@@ -648,7 +681,11 @@ mod tests {
         let mut db = Database::open_in_memory().unwrap();
         register(db.conn_mut(), &[steam_game(5, "X", "C:\\a")]).unwrap();
         let id = list_games(db.conn(), "", SortOrder::Title).unwrap()[0].id;
-        let record = MetadataRecord { steam_app_id: 5, available: false, ..Default::default() };
+        let record = MetadataRecord {
+            steam_app_id: 5,
+            available: false,
+            ..Default::default()
+        };
         save_metadata(db.conn(), id, &record).unwrap();
         assert!(games_needing_metadata(db.conn(), 10).unwrap().is_empty());
         assert!(!get_metadata(db.conn(), id).unwrap().unwrap().available);
@@ -659,7 +696,11 @@ mod tests {
     #[test]
     fn renaming_keeps_the_sort_title_in_sync() {
         let mut db = Database::open_in_memory().unwrap();
-        register(db.conn_mut(), &[steam_game(1, "zzz", "C:\\a"), steam_game(2, "mmm", "C:\\b")]).unwrap();
+        register(
+            db.conn_mut(),
+            &[steam_game(1, "zzz", "C:\\a"), steam_game(2, "mmm", "C:\\b")],
+        )
+        .unwrap();
         let id = list_games(db.conn(), "zzz", SortOrder::Title).unwrap()[0].id;
         rename_game(db.conn(), id, "Aaa Nuevo").unwrap();
         let first = list_games(db.conn(), "", SortOrder::Title).unwrap();
@@ -667,7 +708,12 @@ mod tests {
     }
 
     fn owned(app_id: u64, name: &str, minutes: u64, last: Option<i64>) -> OwnedGame {
-        OwnedGame { app_id, name: name.into(), playtime_minutes: minutes, last_played_at: last }
+        OwnedGame {
+            app_id,
+            name: name.into(),
+            playtime_minutes: minutes,
+            last_played_at: last,
+        }
     }
 
     #[test]
@@ -675,7 +721,11 @@ mod tests {
         let mut db = Database::open_in_memory().unwrap();
         replace_account_games(
             db.conn_mut(),
-            &[owned(220, "Half-Life 2", 120, Some(100)), owned(440, "Team Fortress 2", 5, None), owned(10, "Counter-Strike", 0, Some(50))],
+            &[
+                owned(220, "Half-Life 2", 120, Some(100)),
+                owned(440, "Team Fortress 2", 5, None),
+                owned(10, "Counter-Strike", 0, Some(50)),
+            ],
         )
         .unwrap();
         assert_eq!(count_account_games(db.conn()).unwrap(), (3, 3));
@@ -691,7 +741,12 @@ mod tests {
         assert_eq!(count_account_games(db.conn()).unwrap(), (3, 2));
 
         // Búsqueda y orden por última partida.
-        assert_eq!(list_owned_only(db.conn(), "team", SortOrder::Title).unwrap().len(), 1);
+        assert_eq!(
+            list_owned_only(db.conn(), "team", SortOrder::Title)
+                .unwrap()
+                .len(),
+            1
+        );
         let recent = list_owned_only(db.conn(), "", SortOrder::RecentlyPlayed).unwrap();
         assert_eq!(recent[0].name, "Counter-Strike");
         assert_eq!(recent[1].name, "Team Fortress 2"); // sin fecha, al final
@@ -700,7 +755,11 @@ mod tests {
     #[test]
     fn replacing_the_account_library_discards_the_old_copy() {
         let mut db = Database::open_in_memory().unwrap();
-        replace_account_games(db.conn_mut(), &[owned(1, "A", 0, None), owned(2, "B", 0, None)]).unwrap();
+        replace_account_games(
+            db.conn_mut(),
+            &[owned(1, "A", 0, None), owned(2, "B", 0, None)],
+        )
+        .unwrap();
         replace_account_games(db.conn_mut(), &[owned(3, "C", 0, None)]).unwrap();
         assert_eq!(count_account_games(db.conn()).unwrap(), (1, 1));
         clear_account_games(db.conn()).unwrap();
@@ -712,7 +771,10 @@ mod tests {
         let mut db = Database::open_in_memory().unwrap();
         register(
             db.conn_mut(),
-            &[steam_game(1, "Alfa", "C:\\a"), steam_game(2, "Beta", "C:\\b")],
+            &[
+                steam_game(1, "Alfa", "C:\\a"),
+                steam_game(2, "Beta", "C:\\b"),
+            ],
         )
         .unwrap();
         let beta = list_games(db.conn(), "beta", SortOrder::Title).unwrap()[0].id;

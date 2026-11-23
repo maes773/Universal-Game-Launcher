@@ -50,9 +50,9 @@ pub fn is_shortcut_file(path: &Path) -> bool {
 /// Una URI es válida si su esquema está en la lista permitida y solo lleva caracteres seguros.
 pub fn validate_uri(uri: &str) -> Result<()> {
     let uri = uri.trim();
-    let (scheme, rest) = uri.split_once("://").ok_or_else(|| {
-        UglError::Invalid("La dirección debe tener la forma esquema://…".into())
-    })?;
+    let (scheme, rest) = uri
+        .split_once("://")
+        .ok_or_else(|| UglError::Invalid("La dirección debe tener la forma esquema://…".into()))?;
     if !ALLOWED_URI_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()) {
         return Err(UglError::Invalid(format!(
             "El esquema «{scheme}» no está permitido. Esquemas admitidos: {}.",
@@ -60,7 +60,9 @@ pub fn validate_uri(uri: &str) -> Result<()> {
         )));
     }
     if rest.is_empty() || uri.len() > 512 {
-        return Err(UglError::Invalid("La dirección está vacía o es demasiado larga.".into()));
+        return Err(UglError::Invalid(
+            "La dirección está vacía o es demasiado larga.".into(),
+        ));
     }
     let safe = uri
         .chars()
@@ -82,7 +84,12 @@ pub fn validate_web_url(url: &str) -> Result<()> {
     let safe = url
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || ":/?=&._~%+#@!-,".contains(c));
-    if !ALLOWED_PREFIXES.iter().any(|prefix| url.starts_with(prefix)) || !safe || url.len() > 1024 {
+    if !ALLOWED_PREFIXES
+        .iter()
+        .any(|prefix| url.starts_with(prefix))
+        || !safe
+        || url.len() > 1024
+    {
         return Err(UglError::Invalid("Dirección web no permitida.".into()));
     }
     Ok(())
@@ -154,7 +161,11 @@ fn resolve_working_dir(game: &Game, exe: &Path) -> PathBuf {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| game.install_path.clone())
     };
-    match game.working_dir.as_deref().filter(|dir| !dir.trim().is_empty()) {
+    match game
+        .working_dir
+        .as_deref()
+        .filter(|dir| !dir.trim().is_empty())
+    {
         Some(dir) => {
             let candidate = game.install_path.join(dir);
             if candidate.is_dir() {
@@ -329,7 +340,14 @@ mod tests {
     fn splits_arguments_respecting_quotes() {
         assert_eq!(
             split_args(r#"-windowed -config "C:\Mis Juegos\a.cfg" +map "" x"#),
-            vec!["-windowed", "-config", "C:\\Mis Juegos\\a.cfg", "+map", "", "x"]
+            vec![
+                "-windowed",
+                "-config",
+                "C:\\Mis Juegos\\a.cfg",
+                "+map",
+                "",
+                "x"
+            ]
         );
         assert!(split_args("   ").is_empty());
     }
@@ -337,7 +355,10 @@ mod tests {
     #[test]
     fn only_known_platform_uris_are_accepted() {
         assert!(validate_uri("goggalaxy://openGameView/123").is_ok());
-        assert!(validate_uri("com.epicgames.launcher://apps/Fortnite?action=launch&silent=true").is_ok());
+        assert!(
+            validate_uri("com.epicgames.launcher://apps/Fortnite?action=launch&silent=true")
+                .is_ok()
+        );
         assert!(validate_uri("steam://rungameid/220").is_ok());
         assert!(validate_uri("file:///C:/Windows/System32/cmd.exe").is_err());
         assert!(validate_uri("http://example.com").is_err());
@@ -351,7 +372,10 @@ mod tests {
     fn only_steam_sites_open_in_the_browser() {
         assert!(validate_web_url("https://store.steampowered.com/app/220").is_ok());
         assert!(validate_web_url("https://steamcommunity.com/dev/apikey").is_ok());
-        assert!(validate_web_url("https://steamcommunity.com/openid/login?openid.mode=checkid_setup&a=b%3A").is_ok());
+        assert!(validate_web_url(
+            "https://steamcommunity.com/openid/login?openid.mode=checkid_setup&a=b%3A"
+        )
+        .is_ok());
         assert!(validate_web_url("https://evil.example/").is_err());
         assert!(validate_web_url("https://steamcommunity.com.evil.example/").is_err());
         assert!(validate_web_url("https://store.steampowered.com/a b").is_err());

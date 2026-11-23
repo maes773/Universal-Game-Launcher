@@ -32,7 +32,15 @@ pub fn post_form(url: &str, body: &str) -> Result<String> {
         return Err(UglError::Invalid("Petición no permitida.".into()));
     }
     let mut command = Command::new(CURL);
-    command.args(["--silent", "--show-error", "--max-time", "20", "--data", body, url]);
+    command.args([
+        "--silent",
+        "--show-error",
+        "--max-time",
+        "20",
+        "--data",
+        body,
+        url,
+    ]);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -42,7 +50,10 @@ pub fn post_form(url: &str, body: &str) -> Result<String> {
         .output()
         .map_err(|err| UglError::Invalid(format!("No se pudo ejecutar curl: {err}")))?;
     if !output.status.success() {
-        return Err(UglError::Invalid(format!("curl terminó con error ({}).", output.status)));
+        return Err(UglError::Invalid(format!(
+            "curl terminó con error ({}).",
+            output.status
+        )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }

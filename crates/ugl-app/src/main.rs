@@ -1,5 +1,8 @@
 // En Windows y en modo release no se abre una consola detrás de la ventana.
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -8,13 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
-use ugl_core::diagnostics;
-use ugl_core::integrations::manual::{self, FolderScan};
 use ugl_core::achievement_engine::AchievementView;
 use ugl_core::application::{LaunchOutcome, SteamAchievementJob};
+use ugl_core::diagnostics;
 use ugl_core::domain::{format_date, unix_now, LaunchSettings, MetadataRecord, OwnedGame};
 use ugl_core::icons;
 use ugl_core::integrations::executables::{self, CandidateStatus, ImportCandidate};
+use ugl_core::integrations::manual::{self, FolderScan};
 use ugl_core::integrations::shortcut;
 use ugl_core::integrations::steam;
 use ugl_core::integrations::steam_account::{self, SteamInput};
@@ -57,7 +60,9 @@ struct AppState {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 thread_local! {
@@ -344,13 +349,20 @@ fn show_detail(ui: &MainWindow, state: &AppState, id: GameId) {
         .as_ref()
         .and_then(|m| m.cover_path.as_deref())
         .and_then(|path| cached_image(Path::new(path)));
-    let store_name = metadata.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+    let store_name = metadata
+        .as_ref()
+        .map(|m| m.name.clone())
+        .unwrap_or_default();
     let can_use_store_name = !store_name.is_empty() && store_name != game.title;
     let image = game_icon(&game);
     ui.set_detail(GameDetail {
         has_cover: cover.is_some(),
         cover: cover.unwrap_or_default(),
-        info: metadata.as_ref().map(metadata_info_line).unwrap_or_default().into(),
+        info: metadata
+            .as_ref()
+            .map(metadata_info_line)
+            .unwrap_or_default()
+            .into(),
         description: metadata
             .as_ref()
             .map(|m| m.short_description.clone())
@@ -701,7 +713,9 @@ fn on_steam_scanned(
             kick_icon_worker(ui.as_weak(), state.clone());
         }
         Err(err) => {
-            diagnostics::error(&format!("No se pudo guardar la importación de Steam: {err}"));
+            diagnostics::error(&format!(
+                "No se pudo guardar la importación de Steam: {err}"
+            ));
             set_status(ui, format!("No se pudo guardar la importación: {err}"));
         }
     }
@@ -797,7 +811,10 @@ fn wire_detail(ui: &MainWindow, state: &Arc<AppState>) {
                     Ok(()) => {
                         ui.set_detail_visible(false);
                         ui.set_confirm_remove(false);
-                        set_status(&ui, "Juego quitado de la biblioteca (no se borró ningún archivo).");
+                        set_status(
+                            &ui,
+                            "Juego quitado de la biblioteca (no se borró ningún archivo).",
+                        );
                         refresh_games(&ui, &state);
                     }
                     Err(err) => set_status(&ui, format!("No se pudo quitar el juego: {err}")),
@@ -886,7 +903,10 @@ fn open_achievements(main_ui: &MainWindow, state: &Arc<AppState>, id: GameId) {
         Ok(win) => win,
         Err(err) => {
             diagnostics::error(&format!("No se pudo crear la ventana de logros: {err}"));
-            set_status(main_ui, format!("No se pudo abrir la ventana de logros: {err}"));
+            set_status(
+                main_ui,
+                format!("No se pudo abrir la ventana de logros: {err}"),
+            );
             return;
         }
     };
@@ -895,7 +915,10 @@ fn open_achievements(main_ui: &MainWindow, state: &Arc<AppState>, id: GameId) {
     win.set_status_text("".into());
     render_achievements(&win, state);
     if let Err(err) = win.show() {
-        set_status(main_ui, format!("No se pudo mostrar la ventana de logros: {err}"));
+        set_status(
+            main_ui,
+            format!("No se pudo mostrar la ventana de logros: {err}"),
+        );
         return;
     }
 
@@ -1056,7 +1079,9 @@ fn refresh_achievements_blocking(
     let mut set = match steam_achievements::read_local_achievements(&job.steam_root, job.app_id) {
         Ok(set) => set,
         Err(err) => {
-            diagnostics::warn(&format!("No se pudieron leer los logros del juego {id}: {err}"));
+            diagnostics::warn(&format!(
+                "No se pudieron leer los logros del juego {id}: {err}"
+            ));
             notify_achievements(
                 main,
                 state,
@@ -1203,7 +1228,9 @@ fn sync_steam_library(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>) {
     let summary = match result {
         Ok(summary) => summary,
         Err(err) => {
-            diagnostics::warn(&format!("No se pudo actualizar la biblioteca de Steam: {err}"));
+            diagnostics::warn(&format!(
+                "No se pudo actualizar la biblioteca de Steam: {err}"
+            ));
             return;
         }
     };
@@ -1301,7 +1328,8 @@ fn startup_sync(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
         kick_icon_worker(weak.clone(), state.clone());
         if auto {
             let state_for_ui = state.clone();
-            let _ = weak.upgrade_in_event_loop(move |ui| maybe_auto_sync_account(&ui, &state_for_ui));
+            let _ =
+                weak.upgrade_in_event_loop(move |ui| maybe_auto_sync_account(&ui, &state_for_ui));
         }
     });
 }
@@ -1342,7 +1370,10 @@ fn wire_settings(ui: &MainWindow, state: &Arc<AppState>) {
                     set_status(&ui, "Se descargarán las fichas públicas de Steam Store.");
                     kick_metadata_worker(ui.as_weak(), state.clone());
                 } else {
-                    set_status(&ui, "UGL no consultará Steam Store: usará solo las fichas ya guardadas.");
+                    set_status(
+                        &ui,
+                        "UGL no consultará Steam Store: usará solo las fichas ya guardadas.",
+                    );
                 }
             }
         }
@@ -1455,7 +1486,10 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_busy(false);
                     if paths.is_empty() {
-                        set_status(&ui, "No se encontraron accesos directos (.lnk/.url) en esa carpeta.");
+                        set_status(
+                            &ui,
+                            "No se encontraron accesos directos (.lnk/.url) en esa carpeta.",
+                        );
                     } else {
                         start_preview(&ui, &state, paths);
                     }
@@ -1470,10 +1504,7 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
         move |index, include| {
             {
                 let mut entries = lock(&state.pending_preview);
-                if let Some(entry) = usize::try_from(index)
-                    .ok()
-                    .and_then(|i| entries.get_mut(i))
-                {
+                if let Some(entry) = usize::try_from(index).ok().and_then(|i| entries.get_mut(i)) {
                     if entry.candidate.status == CandidateStatus::New {
                         entry.include = include;
                     }
@@ -1490,10 +1521,7 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
         let state = state.clone();
         move |index, text| {
             let mut entries = lock(&state.pending_preview);
-            if let Some(entry) = usize::try_from(index)
-                .ok()
-                .and_then(|i| entries.get_mut(i))
-            {
+            if let Some(entry) = usize::try_from(index).ok().and_then(|i| entries.get_mut(i)) {
                 entry.name = text.to_string();
             }
         }
@@ -1533,7 +1561,8 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
                     lock(&state.pending_preview).clear();
                     ui.set_preview_visible(false);
                     ui.set_current_view(0);
-                    let mut message = format!("{} juego(s) añadido(s) a la biblioteca.", summary.added);
+                    let mut message =
+                        format!("{} juego(s) añadido(s) a la biblioteca.", summary.added);
                     if summary.already_present > 0 {
                         message.push_str(&format!(" {} ya estaba(n).", summary.already_present));
                     }
@@ -1961,7 +1990,10 @@ fn wire_steam_link(ui: &MainWindow, state: &Arc<AppState>) {
                                 if hits.is_empty() {
                                     "No se encontró nada con ese nombre o AppID.".to_string()
                                 } else {
-                                    format!("{} resultado(s). Elige el correcto y pulsa Asociar.", hits.len())
+                                    format!(
+                                        "{} resultado(s). Elige el correcto y pulsa Asociar.",
+                                        hits.len()
+                                    )
                                 }
                                 .into(),
                             );
@@ -1970,7 +2002,8 @@ fn wire_steam_link(ui: &MainWindow, state: &Arc<AppState>) {
                             ui.set_link_results(ModelRc::new(VecModel::from(items)));
                         }
                         Err(message) => ui.set_link_status(
-                            format!("No se pudo consultar Steam Store (¿sin conexión?): {message}").into(),
+                            format!("No se pudo consultar Steam Store (¿sin conexión?): {message}")
+                                .into(),
                         ),
                     }
                 });
@@ -2162,7 +2195,8 @@ fn begin_background_session(ui: &MainWindow, state: &Arc<AppState>, outcome: Lau
                     format!("No se detectó el proceso de «{title}»; UGL vuelve a mostrarse.")
                 }
                 SessionEnd::Unsupported => {
-                    "No se puede seguir el juego en este sistema; UGL vuelve a mostrarse.".to_string()
+                    "No se puede seguir el juego en este sistema; UGL vuelve a mostrarse."
+                        .to_string()
                 }
             };
             set_status(&ui, message);
@@ -2457,7 +2491,11 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
             ui.set_owned_app_id(app_id as i32);
             ui.set_owned_title(game.name.clone().into());
             ui.set_owned_info(
-                format!("Tiempo de juego: {}  ·  {last_played}", hours_text(game.playtime_minutes)).into(),
+                format!(
+                    "Tiempo de juego: {}  ·  {last_played}",
+                    hours_text(game.playtime_minutes)
+                )
+                .into(),
             );
             let cover_file = steam_store::cover_path(&state.cache_dir, app_id);
             let cover = slint::Image::load_from_path(&cover_file).ok();
@@ -2472,7 +2510,9 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
                 std::thread::spawn(move || {
                     if let Ok(path) = steam_store::ensure_cover(app_id, &state.cache_dir) {
                         let _ = weak.upgrade_in_event_loop(move |ui| {
-                            if ui.get_owned_dialog_visible() && ui.get_owned_app_id() as u64 == app_id {
+                            if ui.get_owned_dialog_visible()
+                                && ui.get_owned_app_id() as u64 == app_id
+                            {
                                 if let Ok(image) = slint::Image::load_from_path(&path) {
                                     ui.set_owned_cover(image);
                                     ui.set_owned_has_cover(true);

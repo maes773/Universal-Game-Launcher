@@ -223,7 +223,11 @@ fn read_callback(mut stream: TcpStream) -> Option<String> {
     let mut parts = first_line.split_whitespace();
     let (method, target) = (parts.next()?, parts.next()?);
     if method == "GET" && target.starts_with(CALLBACK_PATH) {
-        let query = target.split_once('?').map(|(_, q)| q).unwrap_or("").to_string();
+        let query = target
+            .split_once('?')
+            .map(|(_, q)| q)
+            .unwrap_or("")
+            .to_string();
         respond(&mut stream, "200 OK", PAGE);
         Some(query)
     } else {
@@ -291,11 +295,19 @@ pub enum SteamInput {
 pub fn parse_account_input(text: &str) -> Option<SteamInput> {
     let text = text.trim().trim_end_matches('/');
     if text.len() == 17 && text.chars().all(|c| c.is_ascii_digit()) {
-        return text.parse().ok().filter(|id| *id >= MIN_STEAM_ID).map(SteamInput::Id);
+        return text
+            .parse()
+            .ok()
+            .filter(|id| *id >= MIN_STEAM_ID)
+            .map(SteamInput::Id);
     }
     if let Some((_, rest)) = text.split_once("/profiles/") {
         let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-        return digits.parse().ok().filter(|id| *id >= MIN_STEAM_ID).map(SteamInput::Id);
+        return digits
+            .parse()
+            .ok()
+            .filter(|id| *id >= MIN_STEAM_ID)
+            .map(SteamInput::Id);
     }
     if let Some((_, rest)) = text.split_once("/id/") {
         let name: String = rest
@@ -342,7 +354,10 @@ pub fn parse_owned_games(text: &str) -> Result<Vec<OwnedGame>> {
     let response = root
         .get("response")
         .ok_or_else(|| UglError::Invalid("Respuesta inesperada de la API de Steam.".into()))?;
-    let games = response.get("games").and_then(Json::as_array).unwrap_or(&[]);
+    let games = response
+        .get("games")
+        .and_then(Json::as_array)
+        .unwrap_or(&[]);
     let mut seen = std::collections::HashSet::new();
     Ok(games
         .iter()
@@ -366,7 +381,10 @@ pub fn parse_owned_games(text: &str) -> Result<Vec<OwnedGame>> {
             Some(OwnedGame {
                 app_id,
                 name,
-                playtime_minutes: game.get("playtime_forever").and_then(Json::as_u64).unwrap_or(0),
+                playtime_minutes: game
+                    .get("playtime_forever")
+                    .and_then(Json::as_u64)
+                    .unwrap_or(0),
                 last_played_at: last_played,
             })
         })
@@ -411,12 +429,28 @@ fn fetch_text(url: &str, work_dir: &std::path::Path, tag: &str) -> Result<String
     Ok(String::from_utf8_lossy(&bytes?).into_owned())
 }
 
-pub fn fetch_owned_games(key: &str, steam_id: u64, work_dir: &std::path::Path) -> Result<Vec<OwnedGame>> {
-    parse_owned_games(&fetch_text(&owned_games_url(key, steam_id), work_dir, "games")?)
+pub fn fetch_owned_games(
+    key: &str,
+    steam_id: u64,
+    work_dir: &std::path::Path,
+) -> Result<Vec<OwnedGame>> {
+    parse_owned_games(&fetch_text(
+        &owned_games_url(key, steam_id),
+        work_dir,
+        "games",
+    )?)
 }
 
-pub fn fetch_persona(key: &str, steam_id: u64, work_dir: &std::path::Path) -> Result<Option<String>> {
-    Ok(parse_persona(&fetch_text(&player_summary_url(key, steam_id), work_dir, "persona")?))
+pub fn fetch_persona(
+    key: &str,
+    steam_id: u64,
+    work_dir: &std::path::Path,
+) -> Result<Option<String>> {
+    Ok(parse_persona(&fetch_text(
+        &player_summary_url(key, steam_id),
+        work_dir,
+        "persona",
+    )?))
 }
 
 pub fn resolve_vanity(key: &str, vanity: &str, work_dir: &std::path::Path) -> Result<Option<u64>> {
@@ -454,11 +488,18 @@ mod tests {
 
     #[test]
     fn login_url_carries_the_required_openid_fields() {
-        let url = build_login_url("http://127.0.0.1:5000/steam-callback?state=abc", "http://127.0.0.1:5000/");
+        let url = build_login_url(
+            "http://127.0.0.1:5000/steam-callback?state=abc",
+            "http://127.0.0.1:5000/",
+        );
         assert!(url.starts_with("https://steamcommunity.com/openid/login?"));
         assert!(url.contains("openid.mode=checkid_setup"));
-        assert!(url.contains("openid.return_to=http%3A%2F%2F127.0.0.1%3A5000%2Fsteam-callback%3Fstate%3Dabc"));
-        assert!(url.contains("openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select"));
+        assert!(url.contains(
+            "openid.return_to=http%3A%2F%2F127.0.0.1%3A5000%2Fsteam-callback%3Fstate%3Dabc"
+        ));
+        assert!(url.contains(
+            "openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select"
+        ));
     }
 
     #[test]
@@ -477,9 +518,17 @@ mod tests {
         // Otro estado.
         assert!(parse_callback(&good, return_to, "otro").is_err());
         // return_to distinto del solicitado.
-        assert!(parse_callback(&good, "http://127.0.0.1:5000/steam-callback?state=otro", "tok").is_err());
+        assert!(parse_callback(
+            &good,
+            "http://127.0.0.1:5000/steam-callback?state=otro",
+            "tok"
+        )
+        .is_err());
         // Identidad que no es de Steam.
-        let fake = good.replace("steamcommunity.com%2Fopenid%2Fid", "evil.example%2Fopenid%2Fid");
+        let fake = good.replace(
+            "steamcommunity.com%2Fopenid%2Fid",
+            "evil.example%2Fopenid%2Fid",
+        );
         assert!(parse_callback(&fake, return_to, "tok").is_err());
         // Sin firma.
         let unsigned = good.replace("openid.sig=", "x.sig=");
@@ -495,14 +544,22 @@ mod tests {
     fn the_local_server_receives_the_redirect_and_ignores_other_requests() {
         let session = begin_login().unwrap();
         let port = session.listener.local_addr().unwrap().port();
-        assert!(session.login_url.contains(&port.to_string().replace(':', "")) || session.login_url.contains("127.0.0.1"));
+        assert!(
+            session
+                .login_url
+                .contains(&port.to_string().replace(':', ""))
+                || session.login_url.contains("127.0.0.1")
+        );
         let return_to = session.return_to.clone();
         let state = session.state.clone();
         let query = callback_query(&return_to, &state, ID);
 
         let client = std::thread::spawn(move || {
             // Una petición ajena (favicon) y después la devolución real.
-            for target in ["/favicon.ico".to_string(), format!("{CALLBACK_PATH}?{query}")] {
+            for target in [
+                "/favicon.ico".to_string(),
+                format!("{CALLBACK_PATH}?{query}"),
+            ] {
                 let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
                 stream
                     .write_all(format!("GET {target} HTTP/1.1\r\nHost: x\r\n\r\n").as_bytes())
@@ -540,7 +597,10 @@ mod tests {
 
     #[test]
     fn understands_the_ways_a_user_may_identify_their_profile() {
-        assert_eq!(parse_account_input("76561198002516729"), Some(SteamInput::Id(ID)));
+        assert_eq!(
+            parse_account_input("76561198002516729"),
+            Some(SteamInput::Id(ID))
+        );
         assert_eq!(
             parse_account_input("https://steamcommunity.com/profiles/76561198002516729/"),
             Some(SteamInput::Id(ID))
@@ -592,7 +652,10 @@ mod tests {
             parse_vanity(r#"{"response":{"success":1,"steamid":"76561198002516729"}}"#).unwrap(),
             Some(ID)
         );
-        assert_eq!(parse_vanity(r#"{"response":{"success":42}}"#).unwrap(), None);
+        assert_eq!(
+            parse_vanity(r#"{"response":{"success":42}}"#).unwrap(),
+            None
+        );
     }
 
     #[test]

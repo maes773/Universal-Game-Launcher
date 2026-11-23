@@ -268,7 +268,11 @@ mod tests {
 
     #[test]
     fn launch_kind_roundtrip() {
-        for kind in [LaunchKind::Executable, LaunchKind::SteamUri, LaunchKind::Uri] {
+        for kind in [
+            LaunchKind::Executable,
+            LaunchKind::SteamUri,
+            LaunchKind::Uri,
+        ] {
             assert_eq!(LaunchKind::parse(kind.as_str()), Some(kind));
             assert_eq!(LaunchKind::from_index(kind.index()), kind);
         }

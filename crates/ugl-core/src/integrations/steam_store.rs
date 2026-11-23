@@ -155,15 +155,16 @@ pub fn parse_app_details(text: &str, app_id: u64) -> Result<Option<StoreInfo>> {
 
 pub fn parse_search(text: &str) -> Result<Vec<SearchHit>> {
     let root = json::parse(text).map_err(|err| UglError::Invalid(err.to_string()))?;
-    let items = root
-        .get("items")
-        .and_then(Json::as_array)
-        .ok_or_else(|| UglError::Invalid("La búsqueda de Steam Store no devolvió resultados.".into()))?;
+    let items = root.get("items").and_then(Json::as_array).ok_or_else(|| {
+        UglError::Invalid("La búsqueda de Steam Store no devolvió resultados.".into())
+    })?;
     Ok(items
         .iter()
         .filter(|item| {
             // Se descartan paquetes y otros tipos: solo aplicaciones.
-            item.get("type").and_then(Json::as_str).map_or(true, |t| t == "app")
+            item.get("type")
+                .and_then(Json::as_str)
+                .map_or(true, |t| t == "app")
         })
         .filter_map(|item| {
             let app_id = item.get("id").and_then(Json::as_u64)?;
@@ -259,7 +260,10 @@ mod tests {
     fn parses_a_store_page() {
         let info = parse_app_details(DETAILS, 220).unwrap().unwrap();
         assert_eq!(info.name, "Half-Life 2");
-        assert_eq!(info.short_description, "The \"Game\" of the year & more. Segunda línea");
+        assert_eq!(
+            info.short_description,
+            "The \"Game\" of the year & more. Segunda línea"
+        );
         assert_eq!(info.developers, vec!["Valve"]);
         assert_eq!(info.genres, vec!["Acción"]);
         assert_eq!(info.release_date, "16 NOV 2004");
@@ -268,7 +272,10 @@ mod tests {
 
     #[test]
     fn unavailable_pages_are_not_an_error() {
-        assert_eq!(parse_app_details(r#"{"999":{"success":false}}"#, 999).unwrap(), None);
+        assert_eq!(
+            parse_app_details(r#"{"999":{"success":false}}"#, 999).unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -287,21 +294,33 @@ mod tests {
         assert_eq!(
             hits,
             vec![
-                SearchHit { app_id: 220, name: "Half-Life 2".into() },
-                SearchHit { app_id: 7, name: "Sin tipo".into() }
+                SearchHit {
+                    app_id: 220,
+                    name: "Half-Life 2".into()
+                },
+                SearchHit {
+                    app_id: 7,
+                    name: "Sin tipo".into()
+                }
             ]
         );
     }
 
     #[test]
     fn builds_urls_safely() {
-        assert_eq!(url_encode("Half-Life 2: Ep. 1 & más"), "Half-Life%202%3A%20Ep.%201%20%26%20m%C3%A1s");
+        assert_eq!(
+            url_encode("Half-Life 2: Ep. 1 & más"),
+            "Half-Life%202%3A%20Ep.%201%20%26%20m%C3%A1s"
+        );
         assert!(search_url("a b").contains("term=a%20b&l=spanish"));
         assert!(app_details_url(220).contains("appids=220"));
     }
 
     #[test]
     fn cleans_html() {
-        assert_eq!(clean_text("<p>Hola&nbsp;<b>mundo</b></p>\n  fin"), "Hola mundo fin");
+        assert_eq!(
+            clean_text("<p>Hola&nbsp;<b>mundo</b></p>\n  fin"),
+            "Hola mundo fin"
+        );
     }
 }
