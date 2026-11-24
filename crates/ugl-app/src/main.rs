@@ -1,8 +1,5 @@
 // En Windows y en modo release no se abre una consola detrás de la ventana.
-#![cfg_attr(
-    all(not(debug_assertions), target_os = "windows"),
-    windows_subsystem = "windows"
-)]
+#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -11,16 +8,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use ugl_core::diagnostics;
+use ugl_core::integrations::manual::{self, FolderScan};
 use ugl_core::achievement_engine::AchievementView;
 use ugl_core::application::{LaunchOutcome, SteamAchievementJob};
-use ugl_core::diagnostics;
-use ugl_core::domain::{format_date, unix_now, LaunchSettings, MetadataRecord, OwnedGame};
+use ugl_core::domain::{format_date, unix_now, ItchGame, LaunchSettings, MetadataRecord};
 use ugl_core::icons;
 use ugl_core::integrations::executables::{self, CandidateStatus, ImportCandidate};
-use ugl_core::integrations::manual::{self, FolderScan};
 use ugl_core::integrations::shortcut;
 use ugl_core::integrations::steam;
-use ugl_core::integrations::steam_account::{self, SteamInput};
+use ugl_core::integrations::itch;
 use ugl_core::integrations::steam_achievements;
 use ugl_core::integrations::steam_store::{self, SearchHit};
 use ugl_core::process_manager;
@@ -55,14 +52,10 @@ struct AppState {
     metadata_worker_running: AtomicBool,
     /// Resultados de la última búsqueda en Steam Store (asociación manual).
     link_results: Mutex<Vec<SearchHit>>,
-    /// Pide cancelar el inicio de sesión de Steam en curso.
-    account_cancel: AtomicBool,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 thread_local! {
@@ -139,7 +132,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         icon_worker_running: AtomicBool::new(false),
         metadata_worker_running: AtomicBool::new(false),
         link_results: Mutex::new(Vec::new()),
-        account_cancel: AtomicBool::new(false),
     });
 
     let ui = MainWindow::new()?;
@@ -276,26 +268,27 @@ fn refresh_games(ui: &MainWindow, state: &AppState) {
                 })
                 .collect();
 
-            // Con una cuenta vinculada: también los juegos que tienes pero no están instalados. En la
-            // lista llevan la inicial (sin imagen) para no gastar memoria; su portada se carga al abrirlos.
+            // Con la cuenta de itch.io vinculada: también los juegos de tu biblioteca que no están
+            // instalados. En la lista llevan la inicial (sin imagen) para no gastar memoria; su portada se
+            // carga al abrirlos.
             let owned = {
                 let core = lock(&state.core);
-                if core.steam_account().is_some() && core.show_owned_enabled() {
-                    core.list_owned_only(&query)
+                if core.itch_account().is_some() && core.show_itch_enabled() {
+                    core.list_itch_games(&query)
                 } else {
                     Vec::new()
                 }
             };
             for game in owned {
                 items.push(GameItem {
-                    id: game.app_id as i32,
-                    title: game.name.clone().into(),
+                    id: game.game_id as i32,
+                    title: game.title.clone().into(),
                     source: owned_source_line(&game).into(),
                     ach_total: 0,
                     ach_unlocked: 0,
                     icon: Default::default(),
                     has_icon: false,
-                    initial: initial_of(&game.name),
+                    initial: initial_of(&game.title),
                     owned_only: true,
                 });
             }
@@ -349,20 +342,13 @@ fn show_detail(ui: &MainWindow, state: &AppState, id: GameId) {
         .as_ref()
         .and_then(|m| m.cover_path.as_deref())
         .and_then(|path| cached_image(Path::new(path)));
-    let store_name = metadata
-        .as_ref()
-        .map(|m| m.name.clone())
-        .unwrap_or_default();
+    let store_name = metadata.as_ref().map(|m| m.name.clone()).unwrap_or_default();
     let can_use_store_name = !store_name.is_empty() && store_name != game.title;
     let image = game_icon(&game);
     ui.set_detail(GameDetail {
         has_cover: cover.is_some(),
         cover: cover.unwrap_or_default(),
-        info: metadata
-            .as_ref()
-            .map(metadata_info_line)
-            .unwrap_or_default()
-            .into(),
+        info: metadata.as_ref().map(metadata_info_line).unwrap_or_default().into(),
         description: metadata
             .as_ref()
             .map(|m| m.short_description.clone())
@@ -713,9 +699,7 @@ fn on_steam_scanned(
             kick_icon_worker(ui.as_weak(), state.clone());
         }
         Err(err) => {
-            diagnostics::error(&format!(
-                "No se pudo guardar la importación de Steam: {err}"
-            ));
+            diagnostics::error(&format!("No se pudo guardar la importación de Steam: {err}"));
             set_status(ui, format!("No se pudo guardar la importación: {err}"));
         }
     }
@@ -811,10 +795,7 @@ fn wire_detail(ui: &MainWindow, state: &Arc<AppState>) {
                     Ok(()) => {
                         ui.set_detail_visible(false);
                         ui.set_confirm_remove(false);
-                        set_status(
-                            &ui,
-                            "Juego quitado de la biblioteca (no se borró ningún archivo).",
-                        );
+                        set_status(&ui, "Juego quitado de la biblioteca (no se borró ningún archivo).");
                         refresh_games(&ui, &state);
                     }
                     Err(err) => set_status(&ui, format!("No se pudo quitar el juego: {err}")),
@@ -903,10 +884,7 @@ fn open_achievements(main_ui: &MainWindow, state: &Arc<AppState>, id: GameId) {
         Ok(win) => win,
         Err(err) => {
             diagnostics::error(&format!("No se pudo crear la ventana de logros: {err}"));
-            set_status(
-                main_ui,
-                format!("No se pudo abrir la ventana de logros: {err}"),
-            );
+            set_status(main_ui, format!("No se pudo abrir la ventana de logros: {err}"));
             return;
         }
     };
@@ -915,10 +893,7 @@ fn open_achievements(main_ui: &MainWindow, state: &Arc<AppState>, id: GameId) {
     win.set_status_text("".into());
     render_achievements(&win, state);
     if let Err(err) = win.show() {
-        set_status(
-            main_ui,
-            format!("No se pudo mostrar la ventana de logros: {err}"),
-        );
+        set_status(main_ui, format!("No se pudo mostrar la ventana de logros: {err}"));
         return;
     }
 
@@ -1079,9 +1054,7 @@ fn refresh_achievements_blocking(
     let mut set = match steam_achievements::read_local_achievements(&job.steam_root, job.app_id) {
         Ok(set) => set,
         Err(err) => {
-            diagnostics::warn(&format!(
-                "No se pudieron leer los logros del juego {id}: {err}"
-            ));
+            diagnostics::warn(&format!("No se pudieron leer los logros del juego {id}: {err}"));
             notify_achievements(
                 main,
                 state,
@@ -1228,9 +1201,7 @@ fn sync_steam_library(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>) {
     let summary = match result {
         Ok(summary) => summary,
         Err(err) => {
-            diagnostics::warn(&format!(
-                "No se pudo actualizar la biblioteca de Steam: {err}"
-            ));
+            diagnostics::warn(&format!("No se pudo actualizar la biblioteca de Steam: {err}"));
             return;
         }
     };
@@ -1328,8 +1299,7 @@ fn startup_sync(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
         kick_icon_worker(weak.clone(), state.clone());
         if auto {
             let state_for_ui = state.clone();
-            let _ =
-                weak.upgrade_in_event_loop(move |ui| maybe_auto_sync_account(&ui, &state_for_ui));
+            let _ = weak.upgrade_in_event_loop(move |ui| maybe_auto_sync_account(&ui, &state_for_ui));
         }
     });
 }
@@ -1370,10 +1340,7 @@ fn wire_settings(ui: &MainWindow, state: &Arc<AppState>) {
                     set_status(&ui, "Se descargarán las fichas públicas de Steam Store.");
                     kick_metadata_worker(ui.as_weak(), state.clone());
                 } else {
-                    set_status(
-                        &ui,
-                        "UGL no consultará Steam Store: usará solo las fichas ya guardadas.",
-                    );
+                    set_status(&ui, "UGL no consultará Steam Store: usará solo las fichas ya guardadas.");
                 }
             }
         }
@@ -1486,10 +1453,7 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_busy(false);
                     if paths.is_empty() {
-                        set_status(
-                            &ui,
-                            "No se encontraron accesos directos (.lnk/.url) en esa carpeta.",
-                        );
+                        set_status(&ui, "No se encontraron accesos directos (.lnk/.url) en esa carpeta.");
                     } else {
                         start_preview(&ui, &state, paths);
                     }
@@ -1504,7 +1468,10 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
         move |index, include| {
             {
                 let mut entries = lock(&state.pending_preview);
-                if let Some(entry) = usize::try_from(index).ok().and_then(|i| entries.get_mut(i)) {
+                if let Some(entry) = usize::try_from(index)
+                    .ok()
+                    .and_then(|i| entries.get_mut(i))
+                {
                     if entry.candidate.status == CandidateStatus::New {
                         entry.include = include;
                     }
@@ -1521,7 +1488,10 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
         let state = state.clone();
         move |index, text| {
             let mut entries = lock(&state.pending_preview);
-            if let Some(entry) = usize::try_from(index).ok().and_then(|i| entries.get_mut(i)) {
+            if let Some(entry) = usize::try_from(index)
+                .ok()
+                .and_then(|i| entries.get_mut(i))
+            {
                 entry.name = text.to_string();
             }
         }
@@ -1561,8 +1531,7 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
                     lock(&state.pending_preview).clear();
                     ui.set_preview_visible(false);
                     ui.set_current_view(0);
-                    let mut message =
-                        format!("{} juego(s) añadido(s) a la biblioteca.", summary.added);
+                    let mut message = format!("{} juego(s) añadido(s) a la biblioteca.", summary.added);
                     if summary.already_present > 0 {
                         message.push_str(&format!(" {} ya estaba(n).", summary.already_present));
                     }
@@ -1990,10 +1959,7 @@ fn wire_steam_link(ui: &MainWindow, state: &Arc<AppState>) {
                                 if hits.is_empty() {
                                     "No se encontró nada con ese nombre o AppID.".to_string()
                                 } else {
-                                    format!(
-                                        "{} resultado(s). Elige el correcto y pulsa Asociar.",
-                                        hits.len()
-                                    )
+                                    format!("{} resultado(s). Elige el correcto y pulsa Asociar.", hits.len())
                                 }
                                 .into(),
                             );
@@ -2002,8 +1968,7 @@ fn wire_steam_link(ui: &MainWindow, state: &Arc<AppState>) {
                             ui.set_link_results(ModelRc::new(VecModel::from(items)));
                         }
                         Err(message) => ui.set_link_status(
-                            format!("No se pudo consultar Steam Store (¿sin conexión?): {message}")
-                                .into(),
+                            format!("No se pudo consultar Steam Store (¿sin conexión?): {message}").into(),
                         ),
                     }
                 });
@@ -2195,8 +2160,7 @@ fn begin_background_session(ui: &MainWindow, state: &Arc<AppState>, outcome: Lau
                     format!("No se detectó el proceso de «{title}»; UGL vuelve a mostrarse.")
                 }
                 SessionEnd::Unsupported => {
-                    "No se puede seguir el juego en este sistema; UGL vuelve a mostrarse."
-                        .to_string()
+                    "No se puede seguir el juego en este sistema; UGL vuelve a mostrarse.".to_string()
                 }
             };
             set_status(&ui, message);
@@ -2205,70 +2169,50 @@ fn begin_background_session(ui: &MainWindow, state: &Arc<AppState>, outcome: Lau
 }
 
 // ---------------------------------------------------------------------------
-// Cuenta de Steam (opcional): inicio de sesión, clave de la API y biblioteca
+// Cuenta de itch.io (opcional): clave de la API y biblioteca
 // ---------------------------------------------------------------------------
 
-fn hours_text(minutes: u64) -> String {
-    if minutes == 0 {
-        "sin jugar".to_string()
+fn owned_source_line(game: &ItchGame) -> String {
+    if game.author.is_empty() {
+        "itch.io  ·  No instalado".to_string()
     } else {
-        format!("{:.1} h jugadas", minutes as f64 / 60.0)
+        format!("itch.io  ·  No instalado  ·  de {}", game.author)
     }
 }
 
-fn owned_source_line(game: &OwnedGame) -> String {
-    format!(
-        "Cuenta de Steam  ·  No instalado  ·  {}",
-        hours_text(game.playtime_minutes)
-    )
-}
-
-/// Pinta en la vista «Cuenta de Steam» lo que UGL sabe: cuenta, clave y última sincronización.
+/// Pinta en la vista «Cuenta de itch.io» lo que UGL sabe: cuenta y última sincronización.
 fn refresh_account_ui(ui: &MainWindow, state: &AppState) {
-    let (account, counts, last_sync, show_owned) = {
+    let (account, counts, last_sync, show) = {
         let core = lock(&state.core);
         (
-            core.steam_account(),
-            core.account_library_counts(),
-            core.last_account_sync(),
-            core.show_owned_enabled(),
+            core.itch_account(),
+            core.itch_counts(),
+            core.last_itch_sync(),
+            core.show_itch_enabled(),
         )
     };
-    ui.set_show_owned(show_owned);
+    ui.set_show_owned(show);
     ui.set_account_linked(account.is_some());
-    ui.set_account_has_key(account.as_ref().map_or(false, |a| a.has_api_key));
 
     match &account {
         None => {
             ui.set_account_status(
                 "No hay ninguna cuenta vinculada. Es opcional: UGL funciona igual sin ella.".into(),
             );
-            ui.set_account_key_status("".into());
             ui.set_account_sync_status("".into());
         }
         Some(account) => {
             let who = account
-                .persona
+                .username
                 .clone()
-                .unwrap_or_else(|| format!("SteamID {}", account.steam_id));
-            let trust = if account.verified {
-                "identidad confirmada por Steam"
-            } else {
-                "introducida a mano, sin confirmar"
-            };
-            ui.set_account_status(format!("Cuenta vinculada: {who} ({trust}).").into());
-            ui.set_account_key_status(
-                if account.has_api_key {
-                    "Guardada y cifrada en este equipo."
-                } else {
-                    "No guardada: sin ella UGL no puede leer tu biblioteca."
-                }
-                .into(),
+                .unwrap_or_else(|| "tu cuenta de itch.io".to_string());
+            ui.set_account_status(
+                format!("Cuenta vinculada: {who}. La clave está guardada y cifrada en este equipo.").into(),
             );
             ui.set_account_sync_status(
                 match last_sync {
                     Some(time) => format!(
-                        "Última sincronización: {}  ·  {} juegos en tu cuenta, {} sin instalar.",
+                        "Última sincronización: {}  ·  {} juegos en tu biblioteca, {} sin instalar.",
                         format_date(time),
                         counts.0,
                         counts.1
@@ -2282,135 +2226,7 @@ fn refresh_account_ui(ui: &MainWindow, state: &AppState) {
 }
 
 fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
-    // --- Iniciar sesión con Steam (OpenID en el navegador) ---
-    ui.on_account_login_clicked({
-        let weak = ui.as_weak();
-        let state = state.clone();
-        move || {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            let session = match steam_account::begin_login() {
-                Ok(session) => session,
-                Err(err) => {
-                    set_status(&ui, format!("No se pudo preparar el inicio de sesión: {err}"));
-                    return;
-                }
-            };
-            // La dirección se muestra siempre: si el navegador no se abre solo, se puede pegar a mano.
-            ui.set_account_login_url(session.login_url.clone().into());
-            let opened = process_manager::open_web_url(&session.login_url);
-            state.account_cancel.store(false, Ordering::SeqCst);
-            ui.set_account_busy(true);
-            match &opened {
-                Ok(()) => ui.set_account_status(
-                    "Se abrió tu navegador. Inicia sesión en la página de Steam y vuelve aquí. Si no lo ves, copia la dirección de abajo y pégala en tu navegador."
-                        .into(),
-                ),
-                Err(err) => {
-                    diagnostics::warn(&format!("No se pudo abrir el navegador: {err}"));
-                    ui.set_account_status(
-                        format!(
-                            "No pude abrir el navegador automáticamente ({err}). Copia la dirección de abajo, pégala en tu navegador e inicia sesión: UGL sigue esperando."
-                        )
-                        .into(),
-                    );
-                }
-            }
-
-            let weak = weak.clone();
-            let state = state.clone();
-            std::thread::spawn(move || {
-                let outcome = session.wait(std::time::Duration::from_secs(240), &state.account_cancel);
-                let _ = weak.upgrade_in_event_loop(move |ui| {
-                    ui.set_account_busy(false);
-                    ui.set_account_login_url("".into());
-                    match outcome {
-                        Ok(identity) => finish_link(&ui, &state, identity.steam_id, identity.verified),
-                        Err(err) => {
-                            refresh_account_ui(&ui, &state);
-                            set_status(&ui, err.to_string());
-                        }
-                    }
-                });
-            });
-        }
-    });
-
-    ui.on_account_cancel_clicked({
-        let state = state.clone();
-        move || state.account_cancel.store(true, Ordering::SeqCst)
-    });
-
-    ui.on_account_unlink_clicked({
-        let weak = ui.as_weak();
-        let state = state.clone();
-        move || {
-            let result = lock(&state.core).unlink_steam_account();
-            if let Some(ui) = weak.upgrade() {
-                match result {
-                    Ok(()) => set_status(
-                        &ui,
-                        "Cuenta desvinculada. Se borraron tu clave y la copia local de tu biblioteca.",
-                    ),
-                    Err(err) => set_status(&ui, format!("No se pudo desvincular: {err}")),
-                }
-                refresh_account_ui(&ui, &state);
-                refresh_games(&ui, &state);
-            }
-        }
-    });
-
-    // --- Vincular a mano (SteamID64, dirección del perfil o nombre del perfil) ---
-    ui.on_account_link_manual({
-        let weak = ui.as_weak();
-        let state = state.clone();
-        move |text| {
-            let Some(ui) = weak.upgrade() else {
-                return;
-            };
-            match steam_account::parse_account_input(text.as_str()) {
-                Some(SteamInput::Id(steam_id)) => {
-                    ui.set_account_id_input("".into());
-                    finish_link(&ui, &state, steam_id, false);
-                }
-                Some(SteamInput::Vanity(name)) => {
-                    let key = lock(&state.core).api_key();
-                    let Some(key) = key else {
-                        set_status(
-                            &ui,
-                            "Para usar el nombre de tu perfil hace falta tu clave de la Web API. Guárdala primero, o escribe tu SteamID64 / la dirección con /profiles/…",
-                        );
-                        return;
-                    };
-                    ui.set_account_busy(true);
-                    let weak = weak.clone();
-                    let state = state.clone();
-                    std::thread::spawn(move || {
-                        let resolved =
-                            steam_account::resolve_vanity(&key, &name, &state.cache_dir.join("tmp"));
-                        let _ = weak.upgrade_in_event_loop(move |ui| {
-                            ui.set_account_busy(false);
-                            match resolved {
-                                Ok(Some(steam_id)) => {
-                                    ui.set_account_id_input("".into());
-                                    finish_link(&ui, &state, steam_id, false);
-                                }
-                                Ok(None) => set_status(&ui, "Steam no conoce ese nombre de perfil."),
-                                Err(err) => set_status(&ui, err.to_string()),
-                            }
-                        });
-                    });
-                }
-                None => set_status(
-                    &ui,
-                    "No reconozco ese dato. Escribe tu SteamID64 (17 cifras) o la dirección de tu perfil.",
-                ),
-            }
-        }
-    });
-
-    // --- Clave de la Web API ---
+    // --- Vincular con la clave de la API ---
     ui.on_account_save_key({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -2418,17 +2234,16 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            let result = lock(&state.core).set_api_key(text.as_str());
+            let result = lock(&state.core).link_itch_account(text.as_str());
             match result {
                 Ok(()) => {
                     ui.set_account_key_input("".into());
-                    set_status(&ui, "Clave guardada (cifrada en este equipo).");
+                    set_status(&ui, "Cuenta vinculada. Sincronizando tu biblioteca…");
                     refresh_account_ui(&ui, &state);
-                    if lock(&state.core).steam_account().is_some() {
-                        start_account_sync(&ui, &state);
-                    }
+                    refresh_games(&ui, &state);
+                    start_account_sync(&ui, &state);
                 }
-                Err(err) => set_status(&ui, format!("No se pudo guardar la clave: {err}")),
+                Err(err) => set_status(&ui, format!("No se pudo vincular la cuenta: {err}")),
             }
         }
     });
@@ -2436,10 +2251,29 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
     ui.on_account_open_key_page({
         let weak = ui.as_weak();
         move || {
-            if let Err(err) = process_manager::open_web_url(steam_account::API_KEY_PAGE) {
+            if let Err(err) = process_manager::open_web_url(itch::API_KEY_PAGE) {
                 if let Some(ui) = weak.upgrade() {
                     set_status(&ui, format!("No se pudo abrir el navegador: {err}"));
                 }
+            }
+        }
+    });
+
+    ui.on_account_unlink_clicked({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let result = lock(&state.core).unlink_itch_account();
+            if let Some(ui) = weak.upgrade() {
+                match result {
+                    Ok(()) => set_status(
+                        &ui,
+                        "Cuenta desvinculada. Se borraron la clave y la copia local de tu biblioteca.",
+                    ),
+                    Err(err) => set_status(&ui, format!("No se pudo desvincular: {err}")),
+                }
+                refresh_account_ui(&ui, &state);
+                refresh_games(&ui, &state);
             }
         }
     });
@@ -2458,7 +2292,7 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
         let weak = ui.as_weak();
         let state = state.clone();
         move |enabled| {
-            let saved = lock(&state.core).set_show_owned_enabled(enabled);
+            let saved = lock(&state.core).set_show_itch_enabled(enabled);
             if let Err(err) = saved {
                 diagnostics::warn(&format!("No se pudo guardar el ajuste: {err}"));
             }
@@ -2468,51 +2302,51 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
         }
     });
 
-    // --- Juegos de la cuenta que no están instalados ---
+    // --- Juegos de la biblioteca de itch.io que no están instalados ---
     ui.on_owned_clicked({
         let weak = ui.as_weak();
         let state = state.clone();
-        move |app_id| {
+        move |game_id| {
             let Some(ui) = weak.upgrade() else {
                 return;
             };
-            let app_id = app_id as u64;
+            let game_id = game_id as u64;
             let found = lock(&state.core)
-                .list_owned_only("")
+                .list_itch_games("")
                 .into_iter()
-                .find(|game| game.app_id == app_id);
+                .find(|game| game.game_id == game_id);
             let Some(game) = found else {
                 return;
             };
-            let last_played = match game.last_played_at {
-                Some(time) => format!("Última partida: {}", format_date(time)),
-                None => "Nunca jugado".to_string(),
-            };
-            ui.set_owned_app_id(app_id as i32);
-            ui.set_owned_title(game.name.clone().into());
+            ui.set_owned_app_id(game_id as i32);
+            ui.set_owned_title(game.title.clone().into());
             ui.set_owned_info(
-                format!(
-                    "Tiempo de juego: {}  ·  {last_played}",
-                    hours_text(game.playtime_minutes)
-                )
+                if game.author.is_empty() {
+                    String::new()
+                } else {
+                    format!("Autor: {}", game.author)
+                }
                 .into(),
             );
-            let cover_file = steam_store::cover_path(&state.cache_dir, app_id);
-            let cover = slint::Image::load_from_path(&cover_file).ok();
+            ui.set_owned_description(game.description.clone().into());
+
+            let cover_file = itch::cover_file(&state.cache_dir, &game);
+            let cover = cover_file
+                .as_ref()
+                .and_then(|path| slint::Image::load_from_path(path).ok());
             ui.set_owned_has_cover(cover.is_some());
             ui.set_owned_cover(cover.unwrap_or_default());
             ui.set_owned_dialog_visible(true);
 
-            // La portada se descarga solo al abrir el juego (bajo demanda) y si la descarga está permitida.
-            if !cover_file.is_file() && lock(&state.core).fetch_metadata_enabled() {
+            // La portada se descarga solo al abrir el juego (bajo demanda).
+            let missing = cover_file.as_ref().map_or(false, |path| !path.is_file());
+            if missing && game.cover_url.is_some() {
                 let weak = weak.clone();
                 let state = state.clone();
                 std::thread::spawn(move || {
-                    if let Ok(path) = steam_store::ensure_cover(app_id, &state.cache_dir) {
+                    if let Ok(path) = itch::ensure_cover(&game, &state.cache_dir) {
                         let _ = weak.upgrade_in_event_loop(move |ui| {
-                            if ui.get_owned_dialog_visible()
-                                && ui.get_owned_app_id() as u64 == app_id
-                            {
+                            if ui.get_owned_dialog_visible() && ui.get_owned_app_id() as u64 == game_id {
                                 if let Ok(image) = slint::Image::load_from_path(&path) {
                                     ui.set_owned_cover(image);
                                     ui.set_owned_has_cover(true);
@@ -2527,11 +2361,19 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
 
     ui.on_owned_store({
         let weak = ui.as_weak();
-        move |app_id| {
-            let url = format!("https://store.steampowered.com/app/{app_id}");
+        let state = state.clone();
+        move |game_id| {
+            let url = lock(&state.core)
+                .list_itch_games("")
+                .into_iter()
+                .find(|game| game.game_id == game_id as u64)
+                .map(|game| game.url);
+            let Some(url) = url else {
+                return;
+            };
             if let Err(err) = process_manager::open_web_url(&url) {
                 if let Some(ui) = weak.upgrade() {
-                    set_status(&ui, format!("No se pudo abrir la tienda: {err}"));
+                    set_status(&ui, format!("No se pudo abrir la página del juego: {err}"));
                 }
             }
         }
@@ -2547,72 +2389,49 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
     });
 }
 
-/// Guarda la cuenta vinculada y, si ya hay clave, trae su biblioteca.
-fn finish_link(ui: &MainWindow, state: &Arc<AppState>, steam_id: u64, verified: bool) {
-    let linked = lock(&state.core).link_steam_account(steam_id, verified);
-    if let Err(err) = linked {
-        set_status(ui, format!("No se pudo vincular la cuenta: {err}"));
-        return;
-    }
-    refresh_account_ui(ui, state);
-    refresh_games(ui, state);
-    let has_key = lock(&state.core)
-        .steam_account()
-        .map_or(false, |account| account.has_api_key);
-    if has_key {
-        set_status(ui, "Cuenta vinculada. Sincronizando tu biblioteca…");
-        start_account_sync(ui, state);
-    } else {
-        set_status(
-            ui,
-            "Cuenta vinculada. Para ver tu biblioteca, guarda tu clave de la Web API (botón «Conseguir clave»).",
-        );
-    }
-}
-
-/// Trae de Steam el nombre del perfil y la lista de juegos de la cuenta, en un hilo aparte.
+/// Trae de itch.io el nombre de usuario y la lista de juegos de la biblioteca, en un hilo aparte.
 fn start_account_sync(ui: &MainWindow, state: &Arc<AppState>) {
-    let (account, key) = {
+    let (linked, key) = {
         let core = lock(&state.core);
-        (core.steam_account(), core.api_key())
-    };
-    let Some(account) = account else {
-        set_status(ui, "Primero vincula una cuenta de Steam.");
-        return;
+        (core.itch_account().is_some(), core.itch_api_key())
     };
     let Some(key) = key else {
-        ui.set_account_sync_status("Falta la clave de la Web API.".into());
+        set_status(
+            ui,
+            if linked {
+                "No se pudo leer la clave guardada (¿otro usuario de Windows?). Vuelve a vincular la cuenta."
+            } else {
+                "Primero vincula tu cuenta de itch.io."
+            },
+        );
         return;
     };
     ui.set_account_busy(true);
-    ui.set_account_sync_status("Sincronizando tu biblioteca con Steam…".into());
+    ui.set_account_sync_status("Sincronizando tu biblioteca con itch.io…".into());
 
     let weak = ui.as_weak();
     let state = state.clone();
     std::thread::spawn(move || {
-        let work_dir = state.cache_dir.join("tmp");
-        let persona = steam_account::fetch_persona(&key, account.steam_id, &work_dir)
-            .ok()
-            .flatten();
-        let games = steam_account::fetch_owned_games(&key, account.steam_id, &work_dir);
+        let name = itch::fetch_username(&key).ok().flatten();
+        let games = itch::fetch_library(&key);
         let _ = weak.upgrade_in_event_loop(move |ui| {
             ui.set_account_busy(false);
-            if let Some(name) = persona {
-                let _ = lock(&state.core).set_account_persona(&name);
+            if let Some(name) = name {
+                let _ = lock(&state.core).set_itch_username(&name);
             }
             match games {
                 Ok(list) if list.is_empty() => {
-                    // No se pisa lo que ya había: probablemente el perfil es privado.
+                    // No se pisa lo que ya había.
                     refresh_account_ui(&ui, &state);
                     ui.set_account_sync_status(
-                        "Steam no devolvió ningún juego. Si tu perfil tiene los «Detalles de juego» en privado, Steam no entrega la lista: hazlos visibles y vuelve a sincronizar (o revisa tu clave)."
+                        "itch.io no devolvió ningún juego: tu biblioteca puede estar vacía o la clave no tiene acceso."
                             .into(),
                     );
                 }
                 Ok(list) => {
-                    let saved = lock(&state.core).save_owned_games(&list);
+                    let saved = lock(&state.core).save_itch_games(&list);
                     match saved {
-                        Ok(()) => set_status(&ui, format!("Biblioteca sincronizada: {} juegos.", list.len())),
+                        Ok(()) => set_status(&ui, format!("Biblioteca de itch.io sincronizada: {} juegos.", list.len())),
                         Err(err) => set_status(&ui, format!("No se pudo guardar la biblioteca: {err}")),
                     }
                     refresh_account_ui(&ui, &state);
@@ -2627,16 +2446,17 @@ fn start_account_sync(ui: &MainWindow, state: &Arc<AppState>) {
     });
 }
 
-/// Al arrancar: si hay cuenta con clave y la última sincronización tiene más de 12 horas, se repite.
+/// Al arrancar: si hay cuenta vinculada y la última sincronización tiene más de 12 horas, se repite.
 fn maybe_auto_sync_account(ui: &MainWindow, state: &Arc<AppState>) {
     let due = {
         let core = lock(&state.core);
-        match core.steam_account() {
-            Some(account) if account.has_api_key => match core.last_account_sync() {
+        if core.itch_account().is_some() {
+            match core.last_itch_sync() {
                 Some(last) => unix_now() - last > 12 * 3600,
                 None => true,
-            },
-            _ => false,
+            }
+        } else {
+            false
         }
     };
     if due {

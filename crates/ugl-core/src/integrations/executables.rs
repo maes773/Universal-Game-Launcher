@@ -137,11 +137,7 @@ fn from_lnk(candidate: &mut ImportCandidate, info: ShortcutInfo) {
 }
 
 fn from_url(candidate: &mut ImportCandidate, info: ShortcutInfo) {
-    match info
-        .url
-        .as_deref()
-        .and_then(shortcut::steam_app_id_from_url)
-    {
+    match info.url.as_deref().and_then(shortcut::steam_app_id_from_url) {
         Some(app_id) => {
             candidate.kind = LaunchKind::SteamUri;
             candidate.steam_app_id = Some(app_id);

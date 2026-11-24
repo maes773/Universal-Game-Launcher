@@ -46,6 +46,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "biblioteca de la cuenta de Steam",
         sql: include_str!("sql/0006_account_games.sql"),
     },
+    Migration {
+        version: 7,
+        name: "cuenta de itch.io (sustituye a la de Steam)",
+        sql: include_str!("sql/0007_itch_account.sql"),
+    },
 ];
 
 pub fn latest_version() -> i32 {
@@ -102,11 +107,7 @@ fn join_windows(base: &str, target: &str) -> String {
     if absolute {
         target.to_string()
     } else {
-        format!(
-            "{}\\{}",
-            base.trim_end_matches(|c| c == '\\' || c == '/'),
-            target
-        )
+        format!("{}\\{}", base.trim_end_matches(|c| c == '\\' || c == '/'), target)
     }
 }
 
@@ -120,8 +121,9 @@ fn fixup_manual_sources(conn: &Connection) -> Result<()> {
              JOIN installations i ON i.game_id = s.game_id AND i.is_primary = 1
              WHERE s.provider = 'manual' AND i.launch_kind = 'executable'",
         )?;
-        let mapped =
-            stmt.query_map(params![], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
+        let mapped = stmt.query_map(params![], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
         mapped.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for (id, install_path, target) in rows {
@@ -167,52 +169,28 @@ mod tests {
         migrate_to(&mut conn, None, 4).unwrap();
 
         let exe: String = conn
-            .query_row(
-                "SELECT exe_path FROM installations WHERE game_id = 1",
-                params![],
-                |r| r.get(0),
-            )
+            .query_row("SELECT exe_path FROM installations WHERE game_id = 1", params![], |r| r.get(0))
             .unwrap();
         assert_eq!(exe, "bin\\juego.exe");
         let app_id: i64 = conn
-            .query_row(
-                "SELECT steam_app_id FROM installations WHERE game_id = 2",
-                params![],
-                |r| r.get(0),
-            )
+            .query_row("SELECT steam_app_id FROM installations WHERE game_id = 2", params![], |r| r.get(0))
             .unwrap();
         assert_eq!(app_id, 220);
         let args: String = conn
-            .query_row(
-                "SELECT launch_args FROM installations WHERE game_id = 1",
-                params![],
-                |r| r.get(0),
-            )
+            .query_row("SELECT launch_args FROM installations WHERE game_id = 1", params![], |r| r.get(0))
             .unwrap();
         assert_eq!(args, "");
 
         // La identidad del juego manual pasa a ser su ejecutable.
         let key: String = conn
-            .query_row(
-                "SELECT external_id FROM game_sources WHERE game_id = 1",
-                params![],
-                |r| r.get(0),
-            )
+            .query_row("SELECT external_id FROM game_sources WHERE game_id = 1", params![], |r| r.get(0))
             .unwrap();
         assert_eq!(key, "d:\\juegos\\mi juego\\bin\\juego.exe");
 
         // Los datos siguen enlazados y el nuevo tipo 'uri' ya está permitido.
-        let games: i64 = conn
-            .query_row("SELECT COUNT(*) FROM installations", params![], |r| {
-                r.get(0)
-            })
-            .unwrap();
+        let games: i64 = conn.query_row("SELECT COUNT(*) FROM installations", params![], |r| r.get(0)).unwrap();
         assert_eq!(games, 2);
-        conn.execute(
-            "UPDATE installations SET launch_kind = 'uri' WHERE game_id = 1",
-            params![],
-        )
-        .unwrap();
+        conn.execute("UPDATE installations SET launch_kind = 'uri' WHERE game_id = 1", params![]).unwrap();
     }
 
     #[test]
@@ -226,13 +204,8 @@ mod tests {
                  VALUES (1, 'C:\\a', 'executable', 'a.exe', 1);",
         )
         .unwrap();
-        conn.execute("DELETE FROM games WHERE id = 1", params![])
-            .unwrap();
-        let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM installations", params![], |r| {
-                r.get(0)
-            })
-            .unwrap();
+        conn.execute("DELETE FROM games WHERE id = 1", params![]).unwrap();
+        let left: i64 = conn.query_row("SELECT COUNT(*) FROM installations", params![], |r| r.get(0)).unwrap();
         assert_eq!(left, 0);
     }
 }

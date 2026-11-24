@@ -3,10 +3,10 @@
 
 pub mod binary_kv;
 pub mod executables;
+pub mod itch;
 pub mod manual;
 pub mod shortcut;
 pub mod steam;
-pub mod steam_account;
 pub mod steam_achievements;
 pub mod steam_store;
 pub mod vdf;

@@ -107,10 +107,7 @@ pub fn parse_url_file(text: &str) -> ShortcutInfo {
 }
 
 fn u16_at(data: &[u8], offset: usize) -> Option<u16> {
-    Some(u16::from_le_bytes([
-        *data.get(offset)?,
-        *data.get(offset + 1)?,
-    ]))
+    Some(u16::from_le_bytes([*data.get(offset)?, *data.get(offset + 1)?]))
 }
 
 fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
@@ -339,10 +336,7 @@ mod tests {
             Some("-skill 4 +map E1M1"),
         );
         let info = parse_lnk(&bytes, None).unwrap();
-        assert_eq!(
-            info.target,
-            Some(PathBuf::from("C:\\Juegos\\Doom\\doom.exe"))
-        );
+        assert_eq!(info.target, Some(PathBuf::from("C:\\Juegos\\Doom\\doom.exe")));
         assert_eq!(info.arguments, "-skill 4 +map E1M1");
         assert_eq!(info.working_dir, Some(PathBuf::from("C:\\Juegos\\Doom")));
     }
@@ -377,10 +371,7 @@ mod tests {
 
     #[test]
     fn finds_the_app_id_in_steam_exe_arguments() {
-        assert_eq!(
-            steam_app_id_from_args("-applaunch 220 -windowed"),
-            Some(220)
-        );
+        assert_eq!(steam_app_id_from_args("-applaunch 220 -windowed"), Some(220));
         assert_eq!(steam_app_id_from_args("-windowed"), None);
         assert_eq!(steam_app_id_from_args("-applaunch"), None);
     }
@@ -389,10 +380,7 @@ mod tests {
     fn relative_targets_are_resolved_lexically() {
         let base = Path::new("juegos").join("doom");
         let resolved = resolve_relative(&base, "../quake/quake.exe");
-        assert_eq!(
-            resolved,
-            Path::new("juegos").join("quake").join("quake.exe")
-        );
+        assert_eq!(resolved, Path::new("juegos").join("quake").join("quake.exe"));
     }
 
     #[test]
@@ -405,10 +393,7 @@ mod tests {
 
         let url = tmp.path().join("Half-Life 2.url");
         fs::write(&url, "[InternetShortcut]\nURL=steam://rungameid/220\n").unwrap();
-        assert_eq!(
-            steam_app_id_from_url(&read_shortcut(&url).unwrap().url.unwrap()),
-            Some(220)
-        );
+        assert_eq!(steam_app_id_from_url(&read_shortcut(&url).unwrap().url.unwrap()), Some(220));
 
         assert!(read_shortcut(&tmp.path().join("a.txt")).is_err());
         assert!(is_shortcut(&lnk) && is_shortcut(&url));

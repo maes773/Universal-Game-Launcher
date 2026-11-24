@@ -36,12 +36,7 @@ pub fn classify(path: &Path) -> Option<WatchEvent> {
     }
     if let Some(rest) = name.strip_prefix("usergamestats_") {
         // usergamestats_<cuenta>_<appid>.bin
-        let app_id = rest
-            .strip_suffix(".bin")?
-            .rsplit('_')
-            .next()?
-            .parse()
-            .ok()?;
+        let app_id = rest.strip_suffix(".bin")?.rsplit('_').next()?.parse().ok()?;
         return Some(WatchEvent::AchievementsChanged(app_id));
     }
     None
@@ -78,9 +73,10 @@ impl SteamWatcher {
             }
             match watcher.watch(dir, RecursiveMode::NonRecursive) {
                 Ok(()) => watched += 1,
-                Err(err) => {
-                    diagnostics::warn(&format!("No se pudo vigilar {}: {err}", dir.display()))
-                }
+                Err(err) => diagnostics::warn(&format!(
+                    "No se pudo vigilar {}: {err}",
+                    dir.display()
+                )),
             }
         }
         if watched == 0 {
@@ -144,14 +140,8 @@ mod tests {
 
     #[test]
     fn ignores_temporary_and_unrelated_files() {
-        assert_eq!(
-            classify(Path::new("stats/UserGameStats_12345_220.bin.tmp")),
-            None
-        );
+        assert_eq!(classify(Path::new("stats/UserGameStats_12345_220.bin.tmp")), None);
         assert_eq!(classify(Path::new("steamapps/libraryfolders.vdf")), None);
-        assert_eq!(
-            classify(Path::new("stats/UserGameStats_12345_abc.bin")),
-            None
-        );
+        assert_eq!(classify(Path::new("stats/UserGameStats_12345_abc.bin")), None);
     }
 }

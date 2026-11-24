@@ -189,14 +189,9 @@ mod tests {
         let text = "\"root\"\n{\n\t\"path\"\t\"D:\\\\Steam\\\\Lib\"\n\t\"inner\"\n\t{\n\t\t\"k\" \"v\"\n\t}\n}\n";
         let doc = parse(text).unwrap();
         let root = doc.get("ROOT").unwrap();
+        assert_eq!(root.get("path").and_then(Vdf::as_str), Some("D:\\Steam\\Lib"));
         assert_eq!(
-            root.get("path").and_then(Vdf::as_str),
-            Some("D:\\Steam\\Lib")
-        );
-        assert_eq!(
-            root.get("inner")
-                .and_then(|i| i.get("k"))
-                .and_then(Vdf::as_str),
+            root.get("inner").and_then(|i| i.get("k")).and_then(Vdf::as_str),
             Some("v")
         );
     }

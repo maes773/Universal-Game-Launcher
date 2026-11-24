@@ -225,9 +225,7 @@ mod win {
         if ok == 0 {
             return None;
         }
-        Some(PathBuf::from(OsString::from_wide(
-            &buffer[..length as usize],
-        )))
+        Some(PathBuf::from(OsString::from_wide(&buffer[..length as usize])))
     }
 }
 
@@ -236,26 +234,19 @@ mod tests {
     use super::*;
 
     fn p(pid: u32, parent: u32, exe: Option<&str>) -> ProcessInfo {
-        ProcessInfo {
-            pid,
-            parent,
-            exe: exe.map(PathBuf::from),
-        }
+        ProcessInfo { pid, parent, exe: exe.map(PathBuf::from) }
     }
 
     #[test]
     fn the_launched_process_and_its_descendants_belong_to_the_game() {
         let processes = vec![
-            p(10, 1, None),    // ajeno
-            p(100, 10, None),  // el que lanzó UGL
+            p(10, 1, None),   // ajeno
+            p(100, 10, None), // el que lanzó UGL
             p(200, 100, None), // hijo
             p(300, 200, None), // nieto
-            p(400, 10, None),  // hermano ajeno
+            p(400, 10, None), // hermano ajeno
         ];
-        let spec = SessionSpec {
-            root_pid: Some(100),
-            watch_dir: None,
-        };
+        let spec = SessionSpec { root_pid: Some(100), watch_dir: None };
         let active = active_pids(&processes, &spec);
         assert_eq!(active, HashSet::from([100, 200, 300]));
     }
@@ -264,10 +255,7 @@ mod tests {
     fn children_are_found_even_after_the_launcher_exited() {
         // El proceso 100 ya no existe, pero su hijo (parent = 100) sigue vivo.
         let processes = vec![p(200, 100, None), p(5, 1, None)];
-        let spec = SessionSpec {
-            root_pid: Some(100),
-            watch_dir: None,
-        };
+        let spec = SessionSpec { root_pid: Some(100), watch_dir: None };
         assert_eq!(active_pids(&processes, &spec), HashSet::from([200]));
     }
 
@@ -276,11 +264,7 @@ mod tests {
         let processes = vec![
             p(1, 0, Some("C:\\Windows\\explorer.exe")),
             p(2, 1, Some("C:\\Steam\\steamapps\\common\\HL2\\hl2.exe")),
-            p(
-                3,
-                1,
-                Some("c:\\steam\\steamapps\\common\\hl2\\bin\\helper.exe"),
-            ),
+            p(3, 1, Some("c:\\steam\\steamapps\\common\\hl2\\bin\\helper.exe")),
             p(4, 1, Some("C:\\Steam\\steamapps\\common\\HL22\\x.exe")),
             p(5, 1, None),
         ];
@@ -293,13 +277,10 @@ mod tests {
 
     #[test]
     fn tracking_ends_after_the_grace_period() {
-        let spec = SessionSpec {
-            root_pid: Some(100),
-            watch_dir: None,
-        };
+        let spec = SessionSpec { root_pid: Some(100), watch_dir: None };
         let mut script = vec![
-            Some(vec![]),                // todavía no ha arrancado
-            Some(vec![p(100, 1, None)]), // en marcha
+            Some(vec![]),                  // todavía no ha arrancado
+            Some(vec![p(100, 1, None)]),   // en marcha
             Some(vec![p(100, 1, None)]),
             Some(vec![]),                  // hueco (p. ej. del lanzador al juego)
             Some(vec![p(200, 100, None)]), // sigue vivo: el hueco no cuenta
@@ -323,10 +304,7 @@ mod tests {
 
     #[test]
     fn a_game_that_never_appears_times_out() {
-        let spec = SessionSpec {
-            root_pid: Some(100),
-            watch_dir: None,
-        };
+        let spec = SessionSpec { root_pid: Some(100), watch_dir: None };
         let end = track(
             &spec,
             || Some(vec![p(1, 0, None)]),

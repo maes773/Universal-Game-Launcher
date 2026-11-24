@@ -32,7 +32,6 @@ pub struct SteamScan {
     pub steam_root: PathBuf,
     pub libraries: Vec<PathBuf>,
     pub games: Vec<SteamGame>,
-    pub lua_app_ids: Vec<u64>,
     /// Manifiestos cuya carpeta de instalación no existe (descarga incompleta o juego borrado).
     pub skipped_not_installed: usize,
     pub skipped_ignored: usize,
@@ -174,91 +173,16 @@ fn push_unique(list: &mut Vec<PathBuf>, path: PathBuf) {
     }
 }
 
-/// Extrae el AppID del nombre de un archivo Lua.
-/// Ejemplo: "440.lua" -> Some(440).
-fn lua_app_id_from_file_name(file_name: &str) -> Option<u64> {
-    let (id, extension) = file_name.rsplit_once('.')?;
-
-    if !extension.eq_ignore_ascii_case("lua")
-        || id.is_empty()
-        || !id.chars().all(|c| c.is_ascii_digit())
-    {
-        return None;
-    }
-
-    let app_id = id.parse::<u64>().ok()?;
-
-    if app_id == 0 {
-        return None;
-    }
-
-    Some(app_id)
-}
-
-/// Busca archivos Lua en <Steam>/config/lua.
-/// Solo lee nombres de archivo; nunca ejecuta ni interpreta su contenido.
-fn scan_lua_app_ids(steam_root: &Path, warnings: &mut Vec<String>) -> Vec<u64> {
-    let lua_dir = steam_root.join("config").join("lua");
-    let mut app_ids = HashSet::new();
-
-    if !lua_dir.is_dir() {
-        return Vec::new();
-    }
-
-    let entries = match fs::read_dir(&lua_dir) {
-        Ok(entries) => entries,
-        Err(err) => {
-            warnings.push(format!(
-                "No se pudo leer la carpeta Lua {}: {err}",
-                lua_dir.display()
-            ));
-            return Vec::new();
-        }
-    };
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                warnings.push(format!("No se pudo leer una entrada Lua: {err}"));
-                continue;
-            }
-        };
-
-        if !entry
-            .file_type()
-            .map(|kind| kind.is_file())
-            .unwrap_or(false)
-        {
-            continue;
-        }
-
-        let file_name = entry.file_name().to_string_lossy().into_owned();
-
-        if let Some(app_id) = lua_app_id_from_file_name(&file_name) {
-            app_ids.insert(app_id);
-        }
-    }
-
-    let mut result: Vec<u64> = app_ids.into_iter().collect();
-    result.sort_unstable();
-    result
-}
 /// Si `path` está dentro de `<biblioteca>\\steamapps\\common\\<carpeta>`, busca en el manifiesto de esa
 /// carpeta el AppID del juego. Así un juego instalado desde Steam y agregado a mano queda
 /// enlazado con su ficha sin preguntar nada.
 pub fn app_id_for_path(path: &Path) -> Option<u64> {
     let components: Vec<Component<'_>> = path.components().collect();
-    let common_index = components
-        .iter()
-        .enumerate()
-        .position(|(index, component)| {
-            index > 0
-                && component.as_os_str().eq_ignore_ascii_case("common")
-                && components[index - 1]
-                    .as_os_str()
-                    .eq_ignore_ascii_case("steamapps")
-        })?;
+    let common_index = components.iter().enumerate().position(|(index, component)| {
+        index > 0
+            && component.as_os_str().eq_ignore_ascii_case("common")
+            && components[index - 1].as_os_str().eq_ignore_ascii_case("steamapps")
+    })?;
     let steamapps: PathBuf = components[..common_index].iter().collect();
     let folder = components
         .get(common_index + 1)?
@@ -294,8 +218,6 @@ pub fn scan_steam_folder(selected: &Path) -> Result<SteamScan> {
     }
     let root = steam_root_from_selection(selected);
     let mut warnings = Vec::new();
-    // Buscar AppID adicionales en Steam/config/lua.
-    let lua_app_ids = scan_lua_app_ids(&root, &mut warnings);
 
     // 1. Bibliotecas: la propia carpeta elegida + las que declare libraryfolders.vdf.
     let mut candidates = vec![root.clone()];
@@ -422,7 +344,6 @@ pub fn scan_steam_folder(selected: &Path) -> Result<SteamScan> {
         steam_root: root,
         libraries,
         games,
-        lua_app_ids,
         skipped_not_installed,
         skipped_ignored,
         warnings,
@@ -444,27 +365,6 @@ mod tests {
     const ACF_REDIST: &str = "\"AppState\"\n{\n\t\"appid\"\t\t\"228980\"\n\t\"name\"\t\t\"Steamworks Common Redistributables\"\n\t\"installdir\"\t\t\"Steamworks Shared\"\n}\n";
 
     #[test]
-    fn scans_lua_files_by_app_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().join("Steam");
-
-        fs::create_dir_all(root.join("steamapps")).unwrap();
-
-        let lua_dir = root.join("config").join("lua");
-        fs::create_dir_all(&lua_dir).unwrap();
-
-        fs::write(lua_dir.join("220.lua"), "contenido de prueba").unwrap();
-        fs::write(lua_dir.join("201830.lua"), "contenido de prueba").unwrap();
-        fs::write(lua_dir.join("201831.lua"), "contenido de prueba").unwrap();
-        fs::write(lua_dir.join("config.lua"), "contenido de prueba").unwrap();
-        fs::write(lua_dir.join("archivo.txt"), "contenido de prueba").unwrap();
-
-        let scan = scan_steam_folder(&root).unwrap();
-
-        assert_eq!(scan.lua_app_ids, vec![220, 201830, 201831]);
-    }
-
-    #[test]
     fn reads_new_library_folders_format() {
         let paths = parse_library_folders(LIBRARY_FOLDERS_NEW).unwrap();
         assert_eq!(
@@ -484,8 +384,7 @@ mod tests {
 
     #[test]
     fn manifest_with_path_traversal_is_rejected() {
-        let acf =
-            "\"AppState\" { \"appid\" \"1\" \"name\" \"X\" \"installdir\" \"../../Windows\" }";
+        let acf = "\"AppState\" { \"appid\" \"1\" \"name\" \"X\" \"installdir\" \"../../Windows\" }";
         assert!(parse_manifest(acf, "appmanifest_1.acf").is_err());
     }
 
@@ -541,21 +440,12 @@ mod tests {
         fs::create_dir_all(game.join("bin")).unwrap();
         fs::write(apps.join("appmanifest_220.acf"), ACF_HL2).unwrap();
 
-        assert_eq!(
-            app_id_for_path(&game.join("bin").join("hl2.exe")),
-            Some(220)
-        );
+        assert_eq!(app_id_for_path(&game.join("bin").join("hl2.exe")), Some(220));
         assert_eq!(app_id_for_path(&game), Some(220));
         // Fuera de steamapps\common no se asume nada.
-        assert_eq!(
-            app_id_for_path(&tmp.path().join("Otros").join("x.exe")),
-            None
-        );
+        assert_eq!(app_id_for_path(&tmp.path().join("Otros").join("x.exe")), None);
         // Carpeta sin manifiesto.
-        assert_eq!(
-            app_id_for_path(&apps.join("common").join("Desconocido").join("a.exe")),
-            None
-        );
+        assert_eq!(app_id_for_path(&apps.join("common").join("Desconocido").join("a.exe")), None);
     }
 
     #[test]

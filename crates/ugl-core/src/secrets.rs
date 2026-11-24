@@ -1,4 +1,4 @@
-//! Guardado seguro de secretos (la clave de la Web API de Steam). En Windows se cifra con DPAPI:
+//! Guardado seguro de secretos (la clave de la API de itch.io). En Windows se cifra con DPAPI:
 //! solo puede descifrarla el mismo usuario de Windows en este equipo. Fuera de Windows no se
 //! guarda nada (se rechaza), para no dejar una clave en claro en la base de datos.
 
@@ -6,7 +6,7 @@ use crate::error::{Result, UglError};
 
 /// Texto de «entropía» adicional: ata el secreto a UGL.
 #[cfg_attr(not(windows), allow(dead_code))]
-const ENTROPY: &[u8] = b"UGL-steam-api-key-v1";
+const ENTROPY: &[u8] = b"UGL-itch-api-key-v1";
 
 pub fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -45,7 +45,9 @@ pub fn unprotect(_data: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(not(windows))]
 fn unsupported() -> UglError {
-    UglError::Invalid("El guardado cifrado de la clave solo está disponible en Windows.".into())
+    UglError::Invalid(
+        "El guardado cifrado de la clave solo está disponible en Windows.".into(),
+    )
 }
 
 #[cfg(windows)]

@@ -232,15 +232,10 @@ mod tests {
         ));
         let doc = parse(&bytes).unwrap();
         let root = doc.get("root").unwrap();
-        assert_eq!(
-            root.get("texto").and_then(Bkv::as_text),
-            Some("hola".to_string())
-        );
+        assert_eq!(root.get("texto").and_then(Bkv::as_text), Some("hola".to_string()));
         assert_eq!(root.get("numero").and_then(Bkv::as_i64), Some(-1));
         assert_eq!(
-            root.get("hijo")
-                .and_then(|h| h.get("x"))
-                .and_then(Bkv::as_i64),
+            root.get("hijo").and_then(|h| h.get("x")).and_then(Bkv::as_i64),
             Some(7)
         );
     }

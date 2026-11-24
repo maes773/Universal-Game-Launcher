@@ -3,7 +3,7 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::domain::{
-    unix_now, DiscoveredGame, Game, GameId, LaunchKind, MetadataRecord, OwnedGame, RegisterSummary,
+    unix_now, DiscoveredGame, Game, GameId, ItchGame, LaunchKind, MetadataRecord, RegisterSummary,
     SortOrder,
 };
 use crate::error::{Result, UglError};
@@ -242,11 +242,7 @@ pub fn save_metadata(conn: &Connection, game_id: GameId, record: &MetadataRecord
         params![
             game_id,
             record.steam_app_id as i64,
-            if record.available {
-                "ok"
-            } else {
-                "unavailable"
-            },
+            if record.available { "ok" } else { "unavailable" },
             record.name,
             record.short_description,
             join_list(&record.developers),
@@ -288,10 +284,7 @@ pub fn get_metadata(conn: &Connection, game_id: GameId) -> Result<Option<Metadat
 }
 
 pub fn delete_metadata(conn: &Connection, game_id: GameId) -> Result<()> {
-    conn.execute(
-        "DELETE FROM game_metadata WHERE game_id = ?1",
-        params![game_id],
-    )?;
+    conn.execute("DELETE FROM game_metadata WHERE game_id = ?1", params![game_id])?;
     Ok(())
 }
 
@@ -348,27 +341,29 @@ pub fn rename_game(conn: &Connection, id: GameId, title: &str) -> Result<()> {
     Ok(())
 }
 
-/// Condición SQL: el juego de la cuenta (alias `a`) no está en la biblioteca local.
-const OWNED_ONLY: &str = "NOT EXISTS (SELECT 1 FROM installations i WHERE i.steam_app_id = a.app_id AND i.is_primary = 1)
-     AND NOT EXISTS (SELECT 1 FROM game_sources s WHERE s.provider = 'steam' AND s.external_id = CAST(a.app_id AS TEXT))";
+/// Condición SQL: el juego de itch.io (alias `a`) no está ya en la biblioteca local con ese título.
+const ITCH_NOT_IN_LIBRARY: &str =
+    "NOT EXISTS (SELECT 1 FROM games g WHERE lower(g.title) = lower(a.title))";
 
-/// Sustituye la copia local de la biblioteca de la cuenta por la que devuelve Steam.
-pub fn replace_account_games(conn: &mut Connection, games: &[OwnedGame]) -> Result<()> {
+/// Sustituye la copia local de la biblioteca de itch.io por la que devuelve la API.
+pub fn replace_itch_games(conn: &mut Connection, games: &[ItchGame]) -> Result<()> {
     let tx = conn.transaction()?;
-    tx.execute("DELETE FROM account_games", params![])?;
+    tx.execute("DELETE FROM itch_games", params![])?;
     let now = unix_now();
     {
         let mut stmt = tx.prepare(
-            "INSERT OR REPLACE INTO account_games
-                 (app_id, name, playtime_minutes, last_played_at, synced_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO itch_games
+                 (game_id, title, author, url, description, cover_url, synced_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )?;
         for game in games {
             stmt.execute(params![
-                game.app_id as i64,
-                game.name,
-                game.playtime_minutes as i64,
-                game.last_played_at,
+                game.game_id as i64,
+                game.title,
+                game.author,
+                game.url,
+                game.description,
+                game.cover_url,
                 now
             ])?;
         }
@@ -377,50 +372,44 @@ pub fn replace_account_games(conn: &mut Connection, games: &[OwnedGame]) -> Resu
     Ok(())
 }
 
-pub fn clear_account_games(conn: &Connection) -> Result<()> {
-    conn.execute("DELETE FROM account_games", params![])?;
+pub fn clear_itch_games(conn: &Connection) -> Result<()> {
+    conn.execute("DELETE FROM itch_games", params![])?;
     Ok(())
 }
 
-/// Juegos de la cuenta que no están en la biblioteca local (los «no instalados»).
-pub fn list_owned_only(conn: &Connection, query: &str, order: SortOrder) -> Result<Vec<OwnedGame>> {
-    let order_by = match order {
-        SortOrder::RecentlyPlayed => {
-            "a.last_played_at IS NULL, a.last_played_at DESC, lower(a.name) ASC"
-        }
-        _ => "lower(a.name) ASC",
-    };
+/// Juegos de la cuenta de itch.io que no están en la biblioteca local (los «no instalados»).
+pub fn list_itch_not_installed(conn: &Connection, query: &str) -> Result<Vec<ItchGame>> {
     let sql = format!(
-        "SELECT a.app_id, a.name, a.playtime_minutes, a.last_played_at
-         FROM account_games a
-         WHERE a.name LIKE ?1 ESCAPE '\\' AND {OWNED_ONLY}
-         ORDER BY {order_by}"
+        "SELECT a.game_id, a.title, a.author, a.url, a.description, a.cover_url
+         FROM itch_games a
+         WHERE a.title LIKE ?1 ESCAPE '\\' AND {ITCH_NOT_IN_LIBRARY}
+         ORDER BY lower(a.title) ASC"
     );
     let pattern = format!("%{}%", escape_like(query.trim()));
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params![pattern], |row| {
-        Ok(OwnedGame {
-            app_id: row.get::<_, i64>(0)? as u64,
-            name: row.get(1)?,
-            playtime_minutes: row.get::<_, i64>(2)? as u64,
-            last_played_at: row.get(3)?,
+        Ok(ItchGame {
+            game_id: row.get::<_, i64>(0)? as u64,
+            title: row.get(1)?,
+            author: row.get(2)?,
+            url: row.get(3)?,
+            description: row.get(4)?,
+            cover_url: row.get(5)?,
         })
     })?;
-    let games = rows.collect::<rusqlite::Result<Vec<OwnedGame>>>()?;
+    let games = rows.collect::<rusqlite::Result<Vec<ItchGame>>>()?;
     Ok(games)
 }
 
 /// (total en la cuenta, de ellos sin instalar).
-pub fn count_account_games(conn: &Connection) -> Result<(usize, usize)> {
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM account_games", params![], |r| {
-        r.get(0)
-    })?;
-    let not_installed: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM account_games a WHERE {OWNED_ONLY}"),
+pub fn count_itch_games(conn: &Connection) -> Result<(usize, usize)> {
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM itch_games", params![], |r| r.get(0))?;
+    let missing: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM itch_games a WHERE {ITCH_NOT_IN_LIBRARY}"),
         params![],
         |r| r.get(0),
     )?;
-    Ok((total as usize, not_installed as usize))
+    Ok((total as usize, missing as usize))
 }
 
 /// Método de lanzamiento completo de un juego (lo valida `Core::update_launch`).
@@ -477,16 +466,14 @@ pub fn set_icon_path(conn: &Connection, id: GameId, path: &str) -> Result<()> {
 
 /// Olvida el icono para que se vuelva a extraer (por ejemplo, tras cambiar el ejecutable).
 pub fn clear_icon(conn: &Connection, id: GameId) -> Result<()> {
-    conn.execute(
-        "UPDATE games SET icon_path = NULL WHERE id = ?1",
-        params![id],
-    )?;
+    conn.execute("UPDATE games SET icon_path = NULL WHERE id = ?1", params![id])?;
     Ok(())
 }
 
 pub fn games_without_icon(conn: &Connection, limit: usize) -> Result<Vec<Game>> {
-    let sql =
-        format!("{GAME_SELECT} WHERE g.hidden = 0 AND g.icon_path IS NULL ORDER BY g.id LIMIT ?1");
+    let sql = format!(
+        "{GAME_SELECT} WHERE g.hidden = 0 AND g.icon_path IS NULL ORDER BY g.id LIMIT ?1"
+    );
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params![limit as i64], map_game)?;
     let games = rows.collect::<rusqlite::Result<Vec<Game>>>()?;
@@ -561,9 +548,7 @@ mod tests {
         .unwrap();
         assert_eq!(summary.updated, 1);
 
-        let game = list_games(db.conn(), "", SortOrder::Title)
-            .unwrap()
-            .remove(0);
+        let game = list_games(db.conn(), "", SortOrder::Title).unwrap().remove(0);
         assert_eq!(game.install_path, PathBuf::from("D:\\Lib\\common\\HL2"));
     }
 
@@ -592,9 +577,7 @@ mod tests {
 
         let installs: i64 = db
             .conn()
-            .query_row("SELECT COUNT(*) FROM installations", params![], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT COUNT(*) FROM installations", params![], |r| r.get(0))
             .unwrap();
         let sources: i64 = db
             .conn()
@@ -613,10 +596,7 @@ mod tests {
         assert_eq!(games_without_icon(db.conn(), 10).unwrap().len(), 1);
         set_icon_path(db.conn(), id, "").unwrap(); // se intentó y no hay icono
         assert!(games_without_icon(db.conn(), 10).unwrap().is_empty());
-        assert_eq!(
-            get_game(db.conn(), id).unwrap().icon_path.as_deref(),
-            Some("")
-        );
+        assert_eq!(get_game(db.conn(), id).unwrap().icon_path.as_deref(), Some(""));
 
         clear_icon(db.conn(), id).unwrap();
         assert_eq!(games_without_icon(db.conn(), 10).unwrap().len(), 1);
@@ -626,12 +606,8 @@ mod tests {
     fn finds_a_game_by_its_source() {
         let mut db = Database::open_in_memory().unwrap();
         register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
-        assert!(find_game_by_source(db.conn(), "steam", "220")
-            .unwrap()
-            .is_some());
-        assert!(find_game_by_source(db.conn(), "steam", "999")
-            .unwrap()
-            .is_none());
+        assert!(find_game_by_source(db.conn(), "steam", "220").unwrap().is_some());
+        assert!(find_game_by_source(db.conn(), "steam", "999").unwrap().is_none());
     }
 
     fn sample_record(app_id: u64) -> MetadataRecord {
@@ -655,23 +631,14 @@ mod tests {
         register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
         let id = list_games(db.conn(), "", SortOrder::Title).unwrap()[0].id;
 
-        assert_eq!(
-            games_needing_metadata(db.conn(), 10).unwrap(),
-            vec![(id, 220)]
-        );
+        assert_eq!(games_needing_metadata(db.conn(), 10).unwrap(), vec![(id, 220)]);
         save_metadata(db.conn(), id, &sample_record(220)).unwrap();
         assert!(games_needing_metadata(db.conn(), 10).unwrap().is_empty());
-        assert_eq!(
-            get_metadata(db.conn(), id).unwrap(),
-            Some(sample_record(220))
-        );
+        assert_eq!(get_metadata(db.conn(), id).unwrap(), Some(sample_record(220)));
 
         // Cambiar la asociación manualmente obliga a pedir la ficha nueva.
         set_steam_app_id(db.conn(), id, Some(70)).unwrap();
-        assert_eq!(
-            games_needing_metadata(db.conn(), 10).unwrap(),
-            vec![(id, 70)]
-        );
+        assert_eq!(games_needing_metadata(db.conn(), 10).unwrap(), vec![(id, 70)]);
         delete_metadata(db.conn(), id).unwrap();
         assert!(get_metadata(db.conn(), id).unwrap().is_none());
     }
@@ -681,11 +648,7 @@ mod tests {
         let mut db = Database::open_in_memory().unwrap();
         register(db.conn_mut(), &[steam_game(5, "X", "C:\\a")]).unwrap();
         let id = list_games(db.conn(), "", SortOrder::Title).unwrap()[0].id;
-        let record = MetadataRecord {
-            steam_app_id: 5,
-            available: false,
-            ..Default::default()
-        };
+        let record = MetadataRecord { steam_app_id: 5, available: false, ..Default::default() };
         save_metadata(db.conn(), id, &record).unwrap();
         assert!(games_needing_metadata(db.conn(), 10).unwrap().is_empty());
         assert!(!get_metadata(db.conn(), id).unwrap().unwrap().available);
@@ -696,74 +659,51 @@ mod tests {
     #[test]
     fn renaming_keeps_the_sort_title_in_sync() {
         let mut db = Database::open_in_memory().unwrap();
-        register(
-            db.conn_mut(),
-            &[steam_game(1, "zzz", "C:\\a"), steam_game(2, "mmm", "C:\\b")],
-        )
-        .unwrap();
+        register(db.conn_mut(), &[steam_game(1, "zzz", "C:\\a"), steam_game(2, "mmm", "C:\\b")]).unwrap();
         let id = list_games(db.conn(), "zzz", SortOrder::Title).unwrap()[0].id;
         rename_game(db.conn(), id, "Aaa Nuevo").unwrap();
         let first = list_games(db.conn(), "", SortOrder::Title).unwrap();
         assert_eq!(first[0].title, "Aaa Nuevo");
     }
 
-    fn owned(app_id: u64, name: &str, minutes: u64, last: Option<i64>) -> OwnedGame {
-        OwnedGame {
-            app_id,
-            name: name.into(),
-            playtime_minutes: minutes,
-            last_played_at: last,
+    fn itch(game_id: u64, title: &str) -> ItchGame {
+        ItchGame {
+            game_id,
+            title: title.into(),
+            author: "Autor".into(),
+            url: format!("https://autor.itch.io/juego-{game_id}"),
+            description: String::new(),
+            cover_url: None,
         }
     }
 
     #[test]
-    fn account_games_hide_what_is_already_in_the_library() {
+    fn itch_games_hide_what_is_already_in_the_library_by_title() {
         let mut db = Database::open_in_memory().unwrap();
-        replace_account_games(
-            db.conn_mut(),
-            &[
-                owned(220, "Half-Life 2", 120, Some(100)),
-                owned(440, "Team Fortress 2", 5, None),
-                owned(10, "Counter-Strike", 0, Some(50)),
-            ],
-        )
-        .unwrap();
-        assert_eq!(count_account_games(db.conn()).unwrap(), (3, 3));
+        replace_itch_games(db.conn_mut(), &[itch(1, "Celeste Clon"), itch(2, "Zeta Quest"), itch(3, "alfa")]).unwrap();
+        assert_eq!(count_itch_games(db.conn()).unwrap(), (3, 3));
 
-        // Half-Life 2 se instala (aparece en la biblioteca): deja de ser «no instalado».
-        register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
-        let names: Vec<String> = list_owned_only(db.conn(), "", SortOrder::Title)
+        // «Alfa» ya está instalado (aunque con otras mayúsculas): deja de ser «no instalado».
+        register(db.conn_mut(), &[steam_game(10, "Alfa", "C:\\a")]).unwrap();
+        let titles: Vec<String> = list_itch_not_installed(db.conn(), "")
             .unwrap()
             .into_iter()
-            .map(|g| g.name)
+            .map(|g| g.title)
             .collect();
-        assert_eq!(names, vec!["Counter-Strike", "Team Fortress 2"]);
-        assert_eq!(count_account_games(db.conn()).unwrap(), (3, 2));
-
-        // Búsqueda y orden por última partida.
-        assert_eq!(
-            list_owned_only(db.conn(), "team", SortOrder::Title)
-                .unwrap()
-                .len(),
-            1
-        );
-        let recent = list_owned_only(db.conn(), "", SortOrder::RecentlyPlayed).unwrap();
-        assert_eq!(recent[0].name, "Counter-Strike");
-        assert_eq!(recent[1].name, "Team Fortress 2"); // sin fecha, al final
+        assert_eq!(titles, vec!["Celeste Clon", "Zeta Quest"]);
+        assert_eq!(count_itch_games(db.conn()).unwrap(), (3, 2));
+        assert_eq!(list_itch_not_installed(db.conn(), "zeta").unwrap().len(), 1);
+        assert_eq!(list_itch_not_installed(db.conn(), "%").unwrap().len(), 0);
     }
 
     #[test]
-    fn replacing_the_account_library_discards_the_old_copy() {
+    fn replacing_the_itch_library_discards_the_old_copy() {
         let mut db = Database::open_in_memory().unwrap();
-        replace_account_games(
-            db.conn_mut(),
-            &[owned(1, "A", 0, None), owned(2, "B", 0, None)],
-        )
-        .unwrap();
-        replace_account_games(db.conn_mut(), &[owned(3, "C", 0, None)]).unwrap();
-        assert_eq!(count_account_games(db.conn()).unwrap(), (1, 1));
-        clear_account_games(db.conn()).unwrap();
-        assert_eq!(count_account_games(db.conn()).unwrap(), (0, 0));
+        replace_itch_games(db.conn_mut(), &[itch(1, "A"), itch(2, "B")]).unwrap();
+        replace_itch_games(db.conn_mut(), &[itch(3, "C")]).unwrap();
+        assert_eq!(count_itch_games(db.conn()).unwrap(), (1, 1));
+        clear_itch_games(db.conn()).unwrap();
+        assert_eq!(count_itch_games(db.conn()).unwrap(), (0, 0));
     }
 
     #[test]
@@ -771,10 +711,7 @@ mod tests {
         let mut db = Database::open_in_memory().unwrap();
         register(
             db.conn_mut(),
-            &[
-                steam_game(1, "Alfa", "C:\\a"),
-                steam_game(2, "Beta", "C:\\b"),
-            ],
+            &[steam_game(1, "Alfa", "C:\\a"), steam_game(2, "Beta", "C:\\b")],
         )
         .unwrap();
         let beta = list_games(db.conn(), "beta", SortOrder::Title).unwrap()[0].id;

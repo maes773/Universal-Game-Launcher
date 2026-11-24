@@ -272,8 +272,8 @@ mod win {
         let mask = dib_bgra(dc, info.hbm_mask, width, height);
         ReleaseDC(0, dc);
 
-        let mut pixels = color
-            .ok_or_else(|| UglError::Invalid("no se pudieron leer los píxeles del icono".into()))?;
+        let mut pixels =
+            color.ok_or_else(|| UglError::Invalid("no se pudieron leer los píxeles del icono".into()))?;
 
         // Algunos iconos antiguos no traen canal alfa: la transparencia viene de la máscara
         // (negro = opaco).
@@ -364,9 +364,7 @@ mod tests {
 
         let found = icon_source_exe(&job(tmp.path(), LaunchKind::Executable, "bin/juego.exe"));
         assert_eq!(found, Some(tmp.path().join("bin/juego.exe")));
-        assert!(
-            icon_source_exe(&job(tmp.path(), LaunchKind::Executable, "no_existe.exe")).is_none()
-        );
+        assert!(icon_source_exe(&job(tmp.path(), LaunchKind::Executable, "no_existe.exe")).is_none());
     }
 
     #[test]

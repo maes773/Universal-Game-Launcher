@@ -240,22 +240,19 @@ export component MainWindow inherits Window {
     in property <string> preview-summary;
     in property <int> preview-selected: 0;
 
-    // Cuenta de Steam (opcional)
+    // Cuenta de itch.io (opcional)
     in-out property <bool> show-owned: true;
     in property <bool> account-linked: false;
-    in property <bool> account-has-key: false;
     in property <bool> account-busy: false;
     in property <string> account-status;
-    in property <string> account-login-url;
-    in property <string> account-key-status;
     in property <string> account-sync-status;
-    in-out property <string> account-id-input;
     in-out property <string> account-key-input;
-    // Juego de la cuenta que no está instalado
+    // Juego de la cuenta de itch.io que no está instalado
     in property <bool> owned-dialog-visible: false;
     in property <int> owned-app-id: 0;
     in property <string> owned-title;
     in property <string> owned-info;
+    in property <string> owned-description;
     in property <image> owned-cover;
     in property <bool> owned-has-cover: false;
 
@@ -313,10 +310,7 @@ export component MainWindow inherits Window {
     callback launch-browse-workdir();
     callback launch-save(int);
     callback launch-cancel();
-    callback account-login-clicked();
-    callback account-cancel-clicked();
     callback account-unlink-clicked();
-    callback account-link-manual(string);
     callback account-save-key(string);
     callback account-open-key-page();
     callback account-sync-clicked();
@@ -368,7 +362,7 @@ export component MainWindow inherits Window {
                     clicked => { root.current-view = 1; }
                 }
                 NavButton {
-                    label: "Cuenta de Steam";
+                    label: "Cuenta de itch.io";
                     selected: root.current-view == 3;
                     clicked => { root.current-view = 3; }
                 }
@@ -625,20 +619,20 @@ export component MainWindow inherits Window {
                 }
             }
 
-            // ---- Cuenta de Steam ----
+            // ---- Cuenta de itch.io ----
             if root.current-view == 3 : VerticalLayout {
                 vertical-stretch: 1;
                 spacing: 8px;
                 alignment: start;
 
                 Text {
-                    text: "Cuenta de Steam";
+                    text: "Cuenta de itch.io";
                     color: #f2e6d4;
                     font-size: 24px;
                     font-weight: 700;
                 }
                 Text {
-                    text: "Es opcional: UGL funciona igual sin ella. Al vincularla, tu biblioteca de Steam aparece en UGL aunque los juegos no estén instalados en este equipo.";
+                    text: "Es opcional: UGL funciona igual sin ella. Al vincularla, los juegos de tu biblioteca de itch.io (comprados o reclamados) aparecen en UGL aunque no estén instalados en este equipo.";
                     color: #b9a58e;
                     font-size: 13px;
                     wrap: word-wrap;
@@ -651,79 +645,15 @@ export component MainWindow inherits Window {
                 }
                 HorizontalLayout {
                     spacing: 8px;
-                    Button {
-                        text: "Iniciar sesión con Steam";
-                        primary: true;
-                        enabled: !root.account-busy;
-                        clicked => { root.account-login-clicked(); }
-                    }
-                    if root.account-busy : Button {
-                        text: "Cancelar";
-                        clicked => { root.account-cancel-clicked(); }
-                    }
-                    if root.account-linked : Button {
-                        text: "Desvincular cuenta";
-                        enabled: !root.account-busy;
-                        clicked => { root.account-unlink-clicked(); }
-                    }
-                }
-                if root.account-login-url != "" : VerticalLayout {
-                    spacing: 4px;
-
-                    Text {
-                        text: "Si el navegador no se abrió, copia esta dirección y pégala en su barra de direcciones (UGL sigue esperando):";
-                        color: #b9a58e;
-                        font-size: 11px;
-                        wrap: word-wrap;
-                    }
-                    LineEdit {
-                        text: root.account-login-url;
-                        read-only: true;
-                    }
-                }
-                Text {
-                    text: "El inicio de sesión se hace en tu navegador, en la página oficial de Steam. UGL nunca ve tu usuario ni tu contraseña: solo recibe tu SteamID.";
-                    color: #8a7662;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    LineEdit {
-                        text <=> root.account-id-input;
-                        placeholder-text: "…o escribe tu SteamID64 o la dirección de tu perfil";
-                        accepted => { root.account-link-manual(root.account-id-input); }
-                    }
-                    Button {
-                        text: "Vincular";
-                        enabled: !root.account-busy;
-                        clicked => { root.account-link-manual(root.account-id-input); }
-                    }
-                }
-
-                Rectangle { height: 6px; }
-                Text {
-                    text: "Clave de la Web API de Steam";
-                    color: #f2e6d4;
-                    font-size: 15px;
-                    font-weight: 700;
-                }
-                Text {
-                    text: root.account-key-status;
-                    color: #e8b96a;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
-                HorizontalLayout {
-                    spacing: 8px;
                     LineEdit {
                         text <=> root.account-key-input;
                         input-type: InputType.password;
-                        placeholder-text: "Pega aquí tu clave (32 caracteres)";
+                        placeholder-text: "Pega aquí tu clave de API de itch.io";
                         accepted => { root.account-save-key(root.account-key-input); }
                     }
                     Button {
-                        text: "Guardar clave";
+                        text: "Vincular con esta clave";
+                        primary: true;
                         enabled: !root.account-busy;
                         clicked => { root.account-save-key(root.account-key-input); }
                     }
@@ -733,7 +663,7 @@ export component MainWindow inherits Window {
                     }
                 }
                 Text {
-                    text: "Steam solo entrega la lista de juegos de una cuenta a quien tiene una clave de su API. Cada persona genera la suya, gratis, en la página de Steam (se abre con «Conseguir clave»; en el campo de dominio puedes escribir cualquier texto, por ejemplo «localhost»). La clave es personal: UGL la guarda cifrada con tu usuario de Windows y solo la usa para consultar tu biblioteca. Además, tu perfil debe tener los «Detalles de juego» visibles; las cuentas limitadas no pueden obtener clave.";
+                    text: "Así se vincula una cuenta de itch.io desde una aplicación: con una clave de API personal, que generas tú en itch.io (Ajustes → API keys → «Generate new API key»; el botón «Conseguir clave» abre esa página). UGL nunca ve tu usuario ni tu contraseña. La clave se guarda cifrada con tu usuario de Windows y solo se usa para leer tu biblioteca; al desvincular se borra.";
                     color: #8a7662;
                     font-size: 11px;
                     wrap: word-wrap;
@@ -744,8 +674,13 @@ export component MainWindow inherits Window {
                     Button {
                         text: "Sincronizar biblioteca";
                         primary: true;
-                        enabled: root.account-linked && root.account-has-key && !root.account-busy;
+                        enabled: root.account-linked && !root.account-busy;
                         clicked => { root.account-sync-clicked(); }
+                    }
+                    if root.account-linked : Button {
+                        text: "Desvincular cuenta";
+                        enabled: !root.account-busy;
+                        clicked => { root.account-unlink-clicked(); }
                     }
                     Text {
                         horizontal-stretch: 1;
@@ -1438,16 +1373,24 @@ export component MainWindow inherits Window {
                             wrap: word-wrap;
                         }
                         Text {
-                            text: "Está en tu cuenta de Steam, pero no instalado en este equipo.";
+                            text: "Está en tu biblioteca de itch.io, pero no instalado en este equipo.";
                             color: #c98a3b;
                             font-size: 12px;
                             wrap: word-wrap;
                         }
                         Text {
                             text: root.owned-info;
+                            color: #e8b96a;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                        Text {
+                            text: root.owned-description;
                             color: #b9a58e;
                             font-size: 12px;
                             wrap: word-wrap;
+                            overflow: elide;
+                            max-height: 110px;
                         }
                     }
                 }
@@ -1455,7 +1398,7 @@ export component MainWindow inherits Window {
                 HorizontalLayout {
                     spacing: 8px;
                     Button {
-                        text: "Ver en la tienda";
+                        text: "Abrir en itch.io";
                         primary: true;
                         clicked => { root.owned-store(root.owned-app-id); }
                     }

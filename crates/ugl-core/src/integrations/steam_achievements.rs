@@ -90,9 +90,7 @@ fn localized(node: &Bkv) -> Option<String> {
 
 pub fn parse_schema(bytes: &[u8], app_id: u64) -> Result<Vec<SchemaEntry>> {
     let root = binary_kv::parse(bytes).map_err(|err| {
-        UglError::Invalid(format!(
-            "El esquema de logros no se pudo interpretar: {err}"
-        ))
+        UglError::Invalid(format!("El esquema de logros no se pudo interpretar: {err}"))
     })?;
     let app = root
         .get(&app_id.to_string())
@@ -164,9 +162,7 @@ pub fn parse_schema(bytes: &[u8], app_id: u64) -> Result<Vec<SchemaEntry>> {
 
 pub fn parse_user_stats(bytes: &[u8]) -> Result<UserStats> {
     let root = binary_kv::parse(bytes).map_err(|err| {
-        UglError::Invalid(format!(
-            "El archivo de progreso no se pudo interpretar: {err}"
-        ))
+        UglError::Invalid(format!("El archivo de progreso no se pudo interpretar: {err}"))
     })?;
     let cache = root.get("cache").ok_or_else(|| {
         UglError::Invalid("El archivo de progreso no contiene la sección «cache».".into())
@@ -309,10 +305,7 @@ pub fn resolve_missing_icons(
     for achievement in set.achievements.iter_mut() {
         let slots = [
             (achievement.icon_hash.clone(), &mut achievement.icon),
-            (
-                achievement.icon_gray_hash.clone(),
-                &mut achievement.icon_gray,
-            ),
+            (achievement.icon_gray_hash.clone(), &mut achievement.icon_gray),
         ];
         for (hash, slot) in slots {
             if slot.is_some() {
@@ -406,10 +399,7 @@ pub fn read_local_achievements(steam_root: &Path, app_id: u64) -> Result<SteamAc
             } else {
                 None
             };
-            let icon = entry
-                .icon
-                .as_deref()
-                .and_then(|n| resolve_icon(&icon_dir, n));
+            let icon = entry.icon.as_deref().and_then(|n| resolve_icon(&icon_dir, n));
             let icon_gray = entry
                 .icon_gray
                 .as_deref()
@@ -452,10 +442,7 @@ mod tests {
                 obj(
                     "display",
                     cat(&[
-                        obj(
-                            "name",
-                            cat(&[st("english", "First"), st("spanish", "Primero")]),
-                        ),
+                        obj("name", cat(&[st("english", "First"), st("spanish", "Primero")])),
                         obj("desc", st("english", "Do it")),
                         st("icon", "aaa.jpg"),
                         st("icon_gray", "bbb.jpg"),
@@ -477,14 +464,11 @@ mod tests {
                 ),
             ]),
         );
-        let archived = obj("2", cat(&[st("name", "ACH_OLD"), int("archived", 1)]));
-        let stat = obj(
-            "1",
-            cat(&[
-                st("type", "4"),
-                obj("bits", cat(&[first, second, archived])),
-            ]),
+        let archived = obj(
+            "2",
+            cat(&[st("name", "ACH_OLD"), int("archived", 1)]),
         );
+        let stat = obj("1", cat(&[st("type", "4"), obj("bits", cat(&[first, second, archived]))]));
         document(obj("220", obj("stats", stat)))
     }
 
@@ -537,16 +521,8 @@ mod tests {
         let icons = tmp.path().join("appcache").join("librarycache").join("220");
         fs::create_dir_all(&stats_dir).unwrap();
         fs::create_dir_all(&icons).unwrap();
-        fs::write(
-            stats_dir.join("UserGameStatsSchema_220.bin"),
-            schema_bytes(),
-        )
-        .unwrap();
-        fs::write(
-            stats_dir.join("UserGameStats_12345_220.bin"),
-            stats_bytes(0b01),
-        )
-        .unwrap();
+        fs::write(stats_dir.join("UserGameStatsSchema_220.bin"), schema_bytes()).unwrap();
+        fs::write(stats_dir.join("UserGameStats_12345_220.bin"), stats_bytes(0b01)).unwrap();
         fs::write(icons.join("aaa.jpg"), b"jpg").unwrap();
 
         let set = read_local_achievements(tmp.path(), 220).unwrap();
@@ -565,14 +541,8 @@ mod tests {
 
     #[test]
     fn icon_hashes_are_normalised_and_sanitised() {
-        assert_eq!(
-            normalize_icon_hash("abc123.jpg"),
-            Some("abc123".to_string())
-        );
-        assert_eq!(
-            normalize_icon_hash("  abc-1_x "),
-            Some("abc-1_x".to_string())
-        );
+        assert_eq!(normalize_icon_hash("abc123.jpg"), Some("abc123".to_string()));
+        assert_eq!(normalize_icon_hash("  abc-1_x "), Some("abc-1_x".to_string()));
         assert_eq!(normalize_icon_hash(""), None);
         assert_eq!(normalize_icon_hash("../x"), None);
         assert_eq!(normalize_icon_hash("a b"), None);

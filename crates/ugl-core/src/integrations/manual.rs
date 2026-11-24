@@ -49,14 +49,7 @@ const JUNK_NAMES: &[&str] = &[
 ];
 
 /// Utilidades del juego que probablemente no son el ejecutable principal: penalización leve.
-const MINOR_NAMES: &[&str] = &[
-    "update",
-    "patch",
-    "config",
-    "settings",
-    "helper",
-    "benchmark",
-];
+const MINOR_NAMES: &[&str] = &["update", "patch", "config", "settings", "helper", "benchmark"];
 
 #[derive(Debug, Clone)]
 pub struct ExeCandidate {
@@ -107,7 +100,9 @@ impl FolderScan {
         let relative = exe
             .strip_prefix(&self.install_dir)
             .map_err(|_| {
-                UglError::Invalid("El ejecutable debe estar dentro de la carpeta del juego.".into())
+                UglError::Invalid(
+                    "El ejecutable debe estar dentro de la carpeta del juego.".into(),
+                )
             })?
             .to_path_buf();
         if let Some(index) = self.candidates.iter().position(|c| c.relative == relative) {

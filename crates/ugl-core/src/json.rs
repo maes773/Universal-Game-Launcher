@@ -130,10 +130,7 @@ impl<'a> Parser<'a> {
     fn number(&mut self) -> Result<Json, JsonError> {
         let start = self.pos;
         while self.pos < self.bytes.len()
-            && matches!(
-                self.bytes[self.pos],
-                b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E'
-            )
+            && matches!(self.bytes[self.pos], b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E')
         {
             self.pos += 1;
         }
@@ -188,9 +185,7 @@ impl<'a> Parser<'a> {
                             {
                                 self.pos += 2;
                                 let second = self.hex4()?;
-                                0x10000
-                                    + ((first - 0xD800) << 10)
-                                    + (second.wrapping_sub(0xDC00) & 0x3FF)
+                                0x10000 + ((first - 0xD800) << 10) + (second.wrapping_sub(0xDC00) & 0x3FF)
                             } else {
                                 first
                             };
@@ -282,12 +277,7 @@ mod tests {
         assert_eq!(a[1], Json::Num(2.5));
         assert_eq!(a[2], Json::Num(-300.0));
         assert_eq!(a[3].as_str(), Some("x"));
-        assert_eq!(
-            json.get("b")
-                .and_then(|b| b.get("c"))
-                .and_then(Json::as_bool),
-            Some(true)
-        );
+        assert_eq!(json.get("b").and_then(|b| b.get("c")).and_then(Json::as_bool), Some(true));
         assert_eq!(json.get("b").and_then(|b| b.get("d")), Some(&Json::Null));
     }
 
@@ -307,17 +297,7 @@ mod tests {
 
     #[test]
     fn rejects_malformed_documents() {
-        for bad in [
-            "",
-            "{",
-            "[1,",
-            "{\"a\" 1}",
-            "tru",
-            "\"abc",
-            "{\"a\":1} x",
-            "[1 2]",
-            "<html>",
-        ] {
+        for bad in ["", "{", "[1,", "{\"a\" 1}", "tru", "\"abc", "{\"a\":1} x", "[1 2]", "<html>"] {
             assert!(parse(bad).is_err(), "debería fallar: {bad:?}");
         }
         let deep = "[".repeat(200);
