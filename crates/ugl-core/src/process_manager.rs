@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::diagnostics;
-use crate::domain::{Game, GameStatus, LaunchKind};
+use crate::domain::{Game, GameStatus, Installation, LaunchKind};
 use crate::error::{Result, UglError};
 
 /// Esquemas de URI que UGL acepta como método de inicio «otra plataforma».
@@ -24,17 +24,28 @@ pub const ALLOWED_URI_SCHEMES: &[&str] = &[
 /// Comprobación barata (solo consulta si existen carpeta y ejecutable). No se hace en bloque al
 /// arrancar: se usa al abrir la ficha de un juego y al iniciarlo.
 pub fn check_status(game: &Game) -> GameStatus {
-    if game.launch_kind == LaunchKind::Uri {
+    let Some(installation) = game.installation.as_ref() else {
+        return GameStatus::MissingFolder;
+    };
+
+    // Las URI no necesitan una carpeta de instalación.
+    if installation.launch_kind == LaunchKind::Uri {
         return GameStatus::Ready;
     }
-    if !game.install_path.is_dir() {
+
+    if !installation.install_path.is_dir() {
         return GameStatus::MissingFolder;
     }
-    if game.launch_kind == LaunchKind::Executable
-        && !game.install_path.join(&game.launch_target).is_file()
+
+    if installation.launch_kind == LaunchKind::Executable
+        && !installation
+            .install_path
+            .join(&installation.launch_target)
+            .is_file()
     {
         return GameStatus::MissingExecutable;
     }
+
     GameStatus::Ready
 }
 
@@ -50,9 +61,9 @@ pub fn is_shortcut_file(path: &Path) -> bool {
 /// Una URI es válida si su esquema está en la lista permitida y solo lleva caracteres seguros.
 pub fn validate_uri(uri: &str) -> Result<()> {
     let uri = uri.trim();
-    let (scheme, rest) = uri.split_once("://").ok_or_else(|| {
-        UglError::Invalid("La dirección debe tener la forma esquema://…".into())
-    })?;
+    let (scheme, rest) = uri
+        .split_once("://")
+        .ok_or_else(|| UglError::Invalid("La dirección debe tener la forma esquema://…".into()))?;
     if !ALLOWED_URI_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()) {
         return Err(UglError::Invalid(format!(
             "El esquema «{scheme}» no está permitido. Esquemas admitidos: {}.",
@@ -60,7 +71,9 @@ pub fn validate_uri(uri: &str) -> Result<()> {
         )));
     }
     if rest.is_empty() || uri.len() > 512 {
-        return Err(UglError::Invalid("La dirección está vacía o es demasiado larga.".into()));
+        return Err(UglError::Invalid(
+            "La dirección está vacía o es demasiado larga.".into(),
+        ));
     }
     let safe = uri
         .chars()
@@ -138,37 +151,65 @@ pub fn split_args(text: &str) -> Vec<String> {
 
 /// Inicia el juego. Devuelve el PID del proceso lanzado cuando UGL lo inicia directamente.
 pub fn launch(game: &Game) -> Result<Option<u32>> {
-    match game.launch_kind {
-        LaunchKind::Executable => launch_executable(game),
+    let installation = game.installation.as_ref().ok_or_else(|| {
+        UglError::NotFound(format!(
+            "El juego «{}» no tiene una instalación ni un método de inicio configurado.",
+            game.title
+        ))
+    })?;
+
+    match installation.launch_kind {
+        LaunchKind::Executable => launch_executable(game, installation),
+
         LaunchKind::SteamUri => {
             // Solo dígitos: evita que un valor corrupto llegue al intérprete de comandos.
-            let app_id: u64 = game.launch_target.trim().parse().map_err(|_| {
-                UglError::Invalid(format!(
-                    "Identificador de Steam no válido: {}",
-                    game.launch_target
-                ))
-            })?;
-            diagnostics::info(&format!("Iniciando juego de Steam (AppID {app_id})"));
+            let app_id: u64 = installation
+                .launch_target
+                .trim()
+                .parse()
+                .map_err(|_| {
+                    UglError::Invalid(format!(
+                        "Identificador de Steam no válido: {}",
+                        installation.launch_target
+                    ))
+                })?;
+
+            diagnostics::info(&format!(
+                "Iniciando juego de Steam (AppID {app_id})"
+            ));
+
             open_steam_uri(&format!("steam://rungameid/{app_id}")).map(|()| None)
         }
+
         LaunchKind::Uri => {
-            validate_uri(&game.launch_target)?;
-            diagnostics::info(&format!("Iniciando por plataforma: {}", game.launch_target));
-            open_platform_uri(game.launch_target.trim()).map(|()| None)
+            validate_uri(&installation.launch_target)?;
+
+            diagnostics::info(&format!(
+                "Iniciando por plataforma: {}",
+                installation.launch_target
+            ));
+
+            open_platform_uri(installation.launch_target.trim()).map(|()| None)
         }
     }
 }
 
 /// Carpeta de trabajo: la elegida por el usuario (si existe) o la carpeta del ejecutable.
-fn resolve_working_dir(game: &Game, exe: &Path) -> PathBuf {
+fn resolve_working_dir(installation: &Installation, exe: &Path) -> PathBuf {
     let fallback = || {
         exe.parent()
             .map(Path::to_path_buf)
-            .unwrap_or_else(|| game.install_path.clone())
+            .unwrap_or_else(|| installation.install_path.clone())
     };
-    match game.working_dir.as_deref().filter(|dir| !dir.trim().is_empty()) {
+
+    match installation
+        .working_dir
+        .as_deref()
+        .filter(|dir| !dir.trim().is_empty())
+    {
         Some(dir) => {
-            let candidate = game.install_path.join(dir);
+            let candidate = installation.install_path.join(dir);
+
             if candidate.is_dir() {
                 candidate
             } else {
@@ -179,9 +220,15 @@ fn resolve_working_dir(game: &Game, exe: &Path) -> PathBuf {
     }
 }
 
-fn launch_executable(game: &Game) -> Result<Option<u32>> {
+fn launch_executable(
+    game: &Game,
+    installation: &Installation,
+) -> Result<Option<u32>> {
     // Si el destino es absoluto, `join` lo respeta tal cual.
-    let exe = game.install_path.join(&game.launch_target);
+    let exe = installation
+        .install_path
+        .join(&installation.launch_target);
+
     if is_shortcut_file(&exe) {
         return Err(UglError::Invalid(
             "El inicio apunta a un acceso directo (.lnk/.url). Edita el método de inicio del juego \
@@ -189,18 +236,21 @@ fn launch_executable(game: &Game) -> Result<Option<u32>> {
                 .into(),
         ));
     }
+
     if !exe.is_file() {
         return Err(UglError::NotFound(format!(
             "No se encontró el ejecutable en {}. Puedes elegir otro desde la ficha del juego.",
             exe.display()
         )));
     }
-    let working_dir = resolve_working_dir(game, &exe);
+
+    let working_dir = resolve_working_dir(installation, &exe);
+
     diagnostics::info(&format!(
         "Iniciando {} (carpeta de trabajo: {}{})",
         exe.display(),
         working_dir.display(),
-        if game.launch_args.trim().is_empty() {
+        if installation.launch_args.trim().is_empty() {
             ""
         } else {
             "; con argumentos"
@@ -208,8 +258,9 @@ fn launch_executable(game: &Game) -> Result<Option<u32>> {
     ));
 
     let mut command = Command::new(&exe);
-    apply_args(&mut command, &game.launch_args);
+    apply_args(&mut command, &installation.launch_args);
     command.current_dir(&working_dir);
+
     command
         .spawn()
         .map(|child| Some(child.id()))
@@ -322,17 +373,22 @@ mod tests {
             title: "T".into(),
             platform: "pc".into(),
             source: "manual".into(),
-            install_path: PathBuf::from("juego"),
-            launch_kind: kind,
-            launch_target: target.into(),
+
+            installation: Some(Installation {
+                install_path: PathBuf::from("juego"),
+                launch_kind: kind,
+                launch_target: target.into(),
+                exe_path: None,
+                launch_args: String::new(),
+                working_dir: None,
+                steam_app_id: None,
+            }),
+
             added_at: 0,
             last_played_at: None,
             achievements_total: 0,
             achievements_unlocked: 0,
             icon_path: None,
-            exe_path: None,
-            launch_args: String::new(),
-            working_dir: None,
             steam_app_id: None,
         }
     }
@@ -341,7 +397,14 @@ mod tests {
     fn splits_arguments_respecting_quotes() {
         assert_eq!(
             split_args(r#"-windowed -config "C:\Mis Juegos\a.cfg" +map "" x"#),
-            vec!["-windowed", "-config", "C:\\Mis Juegos\\a.cfg", "+map", "", "x"]
+            vec![
+                "-windowed",
+                "-config",
+                "C:\\Mis Juegos\\a.cfg",
+                "+map",
+                "",
+                "x"
+            ]
         );
         assert!(split_args("   ").is_empty());
     }
@@ -349,7 +412,10 @@ mod tests {
     #[test]
     fn only_known_platform_uris_are_accepted() {
         assert!(validate_uri("goggalaxy://openGameView/123").is_ok());
-        assert!(validate_uri("com.epicgames.launcher://apps/Fortnite?action=launch&silent=true").is_ok());
+        assert!(
+            validate_uri("com.epicgames.launcher://apps/Fortnite?action=launch&silent=true")
+                .is_ok()
+        );
         assert!(validate_uri("steam://rungameid/220").is_ok());
         assert!(validate_uri("file:///C:/Windows/System32/cmd.exe").is_err());
         assert!(validate_uri("http://example.com").is_err());
@@ -382,7 +448,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("juego.lnk"), b"x").unwrap();
         let mut g = game(LaunchKind::Executable, "juego.lnk");
-        g.install_path = tmp.path().to_path_buf();
+        g.installation.as_mut().unwrap().install_path = tmp.path().to_path_buf();
         let err = launch(&g).unwrap_err().to_string();
         assert!(err.contains("acceso directo"));
         assert!(is_shortcut_file(Path::new("a.LNK")));
@@ -398,14 +464,25 @@ mod tests {
         let exe = tmp.path().join("bin").join("g.exe");
 
         let mut g = game(LaunchKind::Executable, "bin/g.exe");
-        g.install_path = tmp.path().to_path_buf();
-        assert_eq!(resolve_working_dir(&g, &exe), tmp.path().join("bin"));
+        g.installation.as_mut().unwrap().install_path = tmp.path().to_path_buf();
+        assert_eq!(
+            resolve_working_dir(g.installation.as_ref().unwrap(), &exe),
+            tmp.path().join("bin")
+        );
 
-        g.working_dir = Some("datos".to_string()); // relativa a la carpeta del juego
-        assert_eq!(resolve_working_dir(&g, &exe), tmp.path().join("datos"));
+        // relativa a la carpeta del juego
+        g.installation.as_mut().unwrap().working_dir = Some("datos".to_string());
+        assert_eq!(
+            resolve_working_dir(g.installation.as_ref().unwrap(), &exe),
+            tmp.path().join("datos")
+        );
 
-        g.working_dir = Some("no_existe".to_string()); // inexistente: se vuelve a la del ejecutable
-        assert_eq!(resolve_working_dir(&g, &exe), tmp.path().join("bin"));
+        // inexistente: se vuelve a la del ejecutable
+        g.installation.as_mut().unwrap().working_dir = Some("no_existe".to_string());
+        assert_eq!(
+            resolve_working_dir(g.installation.as_ref().unwrap(), &exe),
+            tmp.path().join("bin")
+        );
     }
 
     #[test]

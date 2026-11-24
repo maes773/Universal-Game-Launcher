@@ -7,19 +7,17 @@ use crate::achievement_engine::{self, AchievementRecord, AchievementView, Proven
 use crate::database::Database;
 use crate::diagnostics;
 use crate::domain::{
-    path_key, DiscoveredGame, Game, GameId, GameStatus, LaunchKind, LaunchSettings,
-    ItchGame, MetadataRecord, RegisterSummary, SortOrder,
+    path_key, DiscoveredGame, Game, GameId, GameStatus, Installation, ItchGame, LaunchKind,
+    LaunchSettings, MetadataRecord, RegisterSummary, SortOrder,
 };
 use crate::error::{Result, UglError};
+use crate::icons::IconJob;
 use crate::integrations::executables::{self, CandidateStatus, ImportCandidate};
+use crate::integrations::itch;
 use crate::integrations::manual::{self, PROVIDER_MANUAL};
 use crate::integrations::steam::SteamScan;
-use crate::icons::IconJob;
 use crate::integrations::steam::PROVIDER_STEAM;
-use crate::integrations::steam_achievements::{
-    self, SteamAchievementSet, SOURCE_STEAM_LOCAL,
-};
-use crate::integrations::itch;
+use crate::integrations::steam_achievements::{self, SteamAchievementSet, SOURCE_STEAM_LOCAL};
 use crate::{process_manager, registry, secrets, settings};
 
 /// Lo necesario para leer los logros de un juego de Steam fuera del hilo de la interfaz.
@@ -46,10 +44,48 @@ pub struct MetadataJob {
     pub app_id: u64,
 }
 
+/// Estado de la consulta de metadatos de un candidato descubierto mediante Steam Lua.
+#[derive(Debug, Clone)]
+pub enum SteamLuaCandidateStatus {
+    /// Steam confirmó que el AppID corresponde a un juego.
+    Ready(crate::integrations::steam_store::StoreInfo),
+
+    /// Steam no ofrece una ficha pública para este AppID.
+    Unavailable,
+
+    /// El AppID existe, pero corresponde a otro tipo de producto.
+    NotGame {
+        product_type: String,
+    },
+
+    /// La consulta falló y puede volver a intentarse.
+    Failed {
+        message: String,
+    },
+}
+
+/// Candidato Lua junto con el resultado de consultar su ficha pública.
+#[derive(Debug, Clone)]
+pub struct SteamLuaCandidate {
+    pub app_id: u64,
+    pub status: SteamLuaCandidateStatus,
+}
+
 /// Cuenta de itch.io vinculada (opcional).
 #[derive(Debug, Clone)]
 pub struct ItchAccount {
     pub username: Option<String>,
+}
+
+/// Obtiene la instalación principal de un juego o devuelve un error
+/// si todavía no está instalado.
+fn require_installation(game: &Game) -> Result<&Installation> {
+    game.installation.as_ref().ok_or_else(|| {
+        UglError::Invalid(format!(
+            "«{}» no tiene una instalación local.",
+            game.title
+        ))
+    })
 }
 
 pub struct Core {
@@ -122,7 +158,10 @@ impl Core {
         manual::validate_game_dir(install_dir)?;
         let exe = install_dir.join(exe_relative);
         if !exe.is_file() {
-            return Err(UglError::NotFound(format!("el ejecutable {}", exe.display())));
+            return Err(UglError::NotFound(format!(
+                "el ejecutable {}",
+                exe.display()
+            )));
         }
 
         // El juego se identifica por su ejecutable: otro .exe de la misma carpeta es otro juego.
@@ -174,21 +213,20 @@ impl Core {
             let Some(exe) = candidate.exe.clone() else {
                 continue;
             };
-            let already = registry::find_game_by_source(
-                self.db.conn(),
-                PROVIDER_MANUAL,
-                &path_key(&exe),
-            )
-            .ok()
-            .flatten()
-            .is_some();
+            let already =
+                registry::find_game_by_source(self.db.conn(), PROVIDER_MANUAL, &path_key(&exe))
+                    .ok()
+                    .flatten()
+                    .is_some();
             if already {
                 candidate.status = CandidateStatus::Duplicate;
                 candidate.note = "Ya está en la biblioteca.".to_string();
-            } else if games
-                .iter()
-                .any(|g| g.launch_kind == LaunchKind::SteamUri && executables::is_inside(&exe, &g.install_path))
-            {
+            } else if games.iter().any(|g| {
+                g.installation.as_ref().is_some_and(|installation| {
+                    installation.launch_kind == LaunchKind::SteamUri
+                        && executables::is_inside(&exe, &installation.install_path)
+                })
+            }) {
                 candidate.status = CandidateStatus::Duplicate;
                 candidate.note = "Ya está en la biblioteca como juego de Steam.".to_string();
             }
@@ -259,7 +297,119 @@ impl Core {
             .filter(|path| path.is_dir())
     }
 
-    /// Recuerda la carpeta que contiene la elegida, para abrir el selector ahí la próxima vez.
+    /// Devuelve los AppID encontrados mediante archivos Lua que todavía
+    /// no están registrados en la biblioteca de UGL.
+    ///
+    /// No registra juegos ni modifica la base de datos.
+    pub fn steam_lua_candidates(&self, scan: &SteamScan) -> Result<Vec<u64>> {
+        let mut candidates = Vec::new();
+
+        for app_id in &scan.lua_app_ids {
+            // Si el juego ya aparece como instalado en este escaneo,
+            // no debe considerarse un candidato nuevo.
+            if scan.games.iter().any(|game| game.app_id == *app_id) {
+                continue;
+            }
+
+            // Si el AppID ya está asociado a un juego de UGL,
+            // tampoco debe aparecer como candidato.
+            if registry::find_game_by_steam_app_id(self.db.conn(), *app_id)?.is_some() {
+                continue;
+            }
+
+            candidates.push(*app_id);
+        }
+
+        Ok(candidates)
+    }
+
+    /// Consulta los metadatos públicos de los AppID descubiertos mediante Steam Lua.
+    ///
+    /// No registra juegos ni modifica la base de datos.
+    /// Los errores individuales se conservan para permitir reintentos posteriores.
+    pub fn fetch_steam_lua_metadata(
+        &self,
+        scan: &SteamScan,
+        work_dir: &Path,
+    ) -> Result<Vec<SteamLuaCandidate>> {
+        let app_ids = self.steam_lua_candidates(scan)?;
+        let mut results = Vec::with_capacity(app_ids.len());
+
+        for app_id in app_ids {
+            let status = match crate::integrations::steam_store::fetch_info(app_id, work_dir) {
+                Ok(Some(info)) if info.is_game() => {
+                    SteamLuaCandidateStatus::Ready(info)
+                }
+
+                Ok(Some(info)) => SteamLuaCandidateStatus::NotGame {
+                    product_type: if info.product_type.is_empty() {
+                        "unknown".to_string()
+                    } else {
+                        info.product_type
+                    },
+                },
+
+                Ok(None) => SteamLuaCandidateStatus::Unavailable,
+
+                Err(err) => SteamLuaCandidateStatus::Failed {
+                    message: err.to_string(),
+                },
+            };
+
+            results.push(SteamLuaCandidate { app_id, status });
+        }
+
+        Ok(results)
+    }
+
+    /// Registra en la biblioteca los candidatos Lua seleccionados por el usuario.
+    ///
+    /// Solo incorpora candidatos cuya ficha pública confirmó que son juegos.
+    /// No crea instalaciones: Steam se encargará de instalarlos posteriormente.
+    pub fn register_steam_lua_candidates(
+        &mut self,
+        candidates: &[SteamLuaCandidate],
+        selected_app_ids: &[u64],
+    ) -> Result<RegisterSummary> {
+        let mut summary = RegisterSummary::default();
+
+        for app_id in selected_app_ids {
+            let Some(candidate) = candidates.iter().find(|candidate| {
+                candidate.app_id == *app_id
+            }) else {
+                continue;
+            };
+
+            let SteamLuaCandidateStatus::Ready(info) = &candidate.status else {
+                continue;
+            };
+
+            let title = info.name.trim();
+
+            if title.is_empty() || info.app_id != *app_id {
+                continue;
+            }
+
+            let result = registry::register_uninstalled_steam_game(
+                self.db.conn_mut(),
+                *app_id,
+                title,
+            )?;
+
+            summary.added += result.added;
+            summary.already_present += result.already_present;
+            summary.updated += result.updated;
+        }
+
+        diagnostics::info(&format!(
+            "Importación de candidatos Steam Lua: {} nuevo(s), {} ya existente(s)",
+            summary.added,
+            summary.already_present
+        ));
+
+        Ok(summary)
+    }
+
     pub fn remember_import_dir(&mut self, picked: &Path) {
         let dir = picked.parent().unwrap_or(picked);
         if let Err(err) = settings::set(
@@ -282,8 +432,12 @@ impl Core {
             .map(|p| p.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join("\n");
-        let saved = settings::set(self.db.conn(), settings::KEY_STEAM_ROOT, &root.to_string_lossy())
-            .and_then(|_| settings::set(self.db.conn(), settings::KEY_STEAM_LIBRARIES, &joined));
+        let saved = settings::set(
+            self.db.conn(),
+            settings::KEY_STEAM_ROOT,
+            &root.to_string_lossy(),
+        )
+        .and_then(|_| settings::set(self.db.conn(), settings::KEY_STEAM_LIBRARIES, &joined));
         if let Err(err) = saved {
             diagnostics::warn(&format!("No se pudo guardar la carpeta de Steam: {err}"));
         }
@@ -344,18 +498,32 @@ impl Core {
         let Some(root) = self.steam_root() else {
             return Vec::new();
         };
-        let games =
-            registry::list_games(self.db.conn(), "", SortOrder::Title).unwrap_or_default();
+
+        let games = registry::list_games(self.db.conn(), "", SortOrder::Title)
+            .unwrap_or_default();
+
         games
             .into_iter()
-            .filter(|g| g.launch_kind == LaunchKind::SteamUri && g.achievements_total > 0)
             .filter_map(|game| {
-                let app_id: u64 = game.launch_target.trim().parse().ok()?;
+                let installation = game.installation.as_ref()?;
+
+                if installation.launch_kind != LaunchKind::SteamUri
+                    || game.achievements_total == 0
+                {
+                    return None;
+                }
+
+                let app_id = game
+                    .steam_app_id
+                    .or_else(|| installation.launch_target.trim().parse().ok())?;
+
                 let modified = steam_achievements::user_stats_modified(&root, app_id)?;
+
                 let synced = achievement_engine::synced_at(self.db.conn(), game.id)
                     .ok()
                     .flatten()
                     .unwrap_or(0);
+
                 (modified > synced).then(|| {
                     (
                         game.id,
@@ -371,17 +539,22 @@ impl Core {
 
     // ---- Iconos de juegos ----
 
+
     /// Juegos a los que todavía no se les ha buscado el icono.
     pub fn icon_jobs(&self, limit: usize) -> Vec<IconJob> {
         registry::games_without_icon(self.db.conn(), limit)
             .unwrap_or_default()
             .into_iter()
-            .map(|game| IconJob {
-                game_id: game.id,
-                install_path: game.install_path,
-                launch_kind: game.launch_kind,
-                launch_target: game.launch_target,
-                exe_path: game.exe_path,
+            .filter_map(|game| {
+                let installation = game.installation?;
+
+                Some(IconJob {
+                    game_id: game.id,
+                    install_path: installation.install_path,
+                    launch_kind: installation.launch_kind,
+                    launch_target: installation.launch_target,
+                    exe_path: installation.exe_path,
+                })
             })
             .collect()
     }
@@ -392,7 +565,9 @@ impl Core {
             .map(|path| path.to_string_lossy().into_owned())
             .unwrap_or_default();
         if let Err(err) = registry::set_icon_path(self.db.conn(), id, &value) {
-            diagnostics::warn(&format!("No se pudo guardar el icono del juego {id}: {err}"));
+            diagnostics::warn(&format!(
+                "No se pudo guardar el icono del juego {id}: {err}"
+            ));
         }
     }
 
@@ -465,7 +640,10 @@ impl Core {
             settings::KEY_ITCH_SYNC,
             &crate::domain::unix_now().to_string(),
         )?;
-        diagnostics::info(&format!("Biblioteca de itch.io sincronizada: {} juegos", games.len()));
+        diagnostics::info(&format!(
+            "Biblioteca de itch.io sincronizada: {} juegos",
+            games.len()
+        ));
         Ok(())
     }
 
@@ -570,22 +748,31 @@ impl Core {
     /// Prepara la lectura de logros de un juego de Steam desde la caché local del cliente.
     pub fn steam_achievement_job(&self, id: GameId) -> Result<SteamAchievementJob> {
         let game = registry::get_game(self.db.conn(), id)?;
-        let app_id: u64 = match game.steam_app_id {
+
+        let app_id = match game.steam_app_id {
             Some(app_id) => app_id,
             None => {
-                if game.launch_kind != LaunchKind::SteamUri {
+                let installation = require_installation(&game)?;
+
+                if installation.launch_kind != LaunchKind::SteamUri {
                     return Err(UglError::Invalid(
                         "Por ahora UGL solo puede leer logros de juegos de Steam.".into(),
                     ));
                 }
-                game.launch_target.trim().parse().map_err(|_| {
-                    UglError::Invalid(format!(
-                        "Identificador de Steam no válido: {}",
-                        game.launch_target
-                    ))
-                })?
+
+                installation
+                    .launch_target
+                    .trim()
+                    .parse()
+                    .map_err(|_| {
+                        UglError::Invalid(format!(
+                            "Identificador de Steam no válido: {}",
+                            installation.launch_target
+                        ))
+                    })?
             }
         };
+
         let steam_root = settings::get(self.db.conn(), settings::KEY_STEAM_ROOT)?
             .map(PathBuf::from)
             .filter(|path| path.join("appcache").is_dir())
@@ -596,6 +783,7 @@ impl Core {
                         .into(),
                 )
             })?;
+
         Ok(SteamAchievementJob { steam_root, app_id })
     }
 
@@ -641,13 +829,23 @@ impl Core {
     /// Inicia el juego y devuelve lo necesario para seguir su sesión.
     pub fn launch_game(&mut self, id: GameId) -> Result<LaunchOutcome> {
         let game = registry::get_game(self.db.conn(), id)?;
+
+        // La ejecución requiere una instalación o un método de lanzamiento válido.
         let pid = process_manager::launch(&game)?;
+
         if let Err(err) = registry::touch_last_played(self.db.conn(), id) {
             diagnostics::warn(&format!("No se pudo anotar la última partida: {err}"));
         }
-        // Los juegos de Steam no cuelgan de UGL: se reconocen por su carpeta.
-        let watch_dir = (game.launch_kind == LaunchKind::SteamUri && game.install_path.is_dir())
-            .then(|| game.install_path.clone());
+
+        let watch_dir = game
+            .installation
+            .as_ref()
+            .filter(|installation| {
+                installation.launch_kind == LaunchKind::SteamUri
+                    && installation.install_path.is_dir()
+            })
+            .map(|installation| installation.install_path.clone());
+
         Ok(LaunchOutcome {
             title: game.title,
             pid,
@@ -679,7 +877,9 @@ impl Core {
     pub fn associate_steam(&mut self, id: GameId, app_id: u64) -> Result<()> {
         registry::set_steam_app_id(self.db.conn(), id, Some(app_id))?;
         registry::delete_metadata(self.db.conn(), id)?;
-        diagnostics::info(&format!("Juego {id} asociado con el AppID {app_id} de Steam"));
+        diagnostics::info(&format!(
+            "Juego {id} asociado con el AppID {app_id} de Steam"
+        ));
         Ok(())
     }
 
@@ -695,7 +895,10 @@ impl Core {
     /// trabajo), Steam u otra plataforma. Conserva los datos de los otros métodos para poder volver.
     pub fn update_launch(&mut self, id: GameId, settings: &LaunchSettings) -> Result<()> {
         let game = registry::get_game(self.db.conn(), id)?;
+        let installation = require_installation(&game)?;
+
         let args = settings.args.trim().to_string();
+
         let working_dir = match &settings.working_dir {
             Some(dir) => {
                 if !dir.is_dir() {
@@ -712,29 +915,35 @@ impl Core {
             LaunchKind::Executable => {
                 let exe: PathBuf = match &settings.exe {
                     Some(path) => path.clone(),
-                    None => game
+                    None => installation
                         .exe_path
                         .as_deref()
-                        .map(|rel| game.install_path.join(rel))
+                        .map(|rel| installation.install_path.join(rel))
                         .ok_or_else(|| {
                             UglError::Invalid(
                                 "Este juego no tiene un ejecutable conocido. Elige uno.".into(),
                             )
                         })?,
                 };
+
                 if process_manager::is_shortcut_file(&exe) {
                     return Err(UglError::Invalid(
                         "Elige el ejecutable (.exe), no un acceso directo.".into(),
                     ));
                 }
+
                 if !exe.is_file() {
-                    return Err(UglError::NotFound(format!("el ejecutable {}", exe.display())));
+                    return Err(UglError::NotFound(format!(
+                        "el ejecutable {}",
+                        exe.display()
+                    )));
                 }
-                // Dentro de la carpeta del juego se guarda relativo; fuera, la ruta completa.
-                let stored = match exe.strip_prefix(&game.install_path) {
+
+                let stored = match exe.strip_prefix(&installation.install_path) {
                     Ok(relative) => relative.to_string_lossy().into_owned(),
                     Err(_) => exe.to_string_lossy().into_owned(),
                 };
+
                 registry::update_launch(
                     self.db.conn(),
                     id,
@@ -747,26 +956,29 @@ impl Core {
                         steam_app_id: game.steam_app_id,
                     },
                 )?;
-                // El icono sale del ejecutable: se vuelve a extraer.
+
                 registry::clear_icon(self.db.conn(), id)?;
             }
+
             LaunchKind::SteamUri => {
                 let app_id = settings.steam_app_id.or(game.steam_app_id).ok_or_else(|| {
                     UglError::Invalid("Indica el AppID de Steam de este juego.".into())
                 })?;
+
                 registry::update_launch(
                     self.db.conn(),
                     id,
                     &registry::LaunchRow {
                         kind: LaunchKind::SteamUri,
                         target: &app_id.to_string(),
-                        exe_path: game.exe_path.as_deref(),
+                        exe_path: installation.exe_path.as_deref(),
                         args: &args,
                         working_dir: working_dir.as_deref(),
                         steam_app_id: Some(app_id),
                     },
                 )?;
             }
+
             LaunchKind::Uri => {
                 let uri = settings
                     .uri
@@ -774,16 +986,20 @@ impl Core {
                     .map(str::trim)
                     .filter(|uri| !uri.is_empty())
                     .ok_or_else(|| {
-                        UglError::Invalid("Escribe la dirección de inicio de la plataforma.".into())
+                        UglError::Invalid(
+                            "Escribe la dirección de inicio de la plataforma.".into(),
+                        )
                     })?;
+
                 process_manager::validate_uri(uri)?;
+
                 registry::update_launch(
                     self.db.conn(),
                     id,
                     &registry::LaunchRow {
                         kind: LaunchKind::Uri,
                         target: uri,
-                        exe_path: game.exe_path.as_deref(),
+                        exe_path: installation.exe_path.as_deref(),
                         args: &args,
                         working_dir: working_dir.as_deref(),
                         steam_app_id: game.steam_app_id,
@@ -791,45 +1007,55 @@ impl Core {
                 )?;
             }
         }
+
         diagnostics::info(&format!(
             "Método de inicio del juego {id}: {}",
             settings.kind.as_str()
         ));
+
         Ok(())
     }
+
 
     /// Cambia el ejecutable asociado (debe estar dentro de la carpeta de instalación).
     pub fn set_game_executable(&mut self, id: GameId, exe: &Path) -> Result<()> {
         let game = registry::get_game(self.db.conn(), id)?;
-        if game.launch_kind != LaunchKind::Executable {
+        let installation = require_installation(&game)?;
+
+        if installation.launch_kind != LaunchKind::Executable {
             return Err(UglError::Invalid(
                 "Este juego se inicia a través de Steam y no tiene un ejecutable propio.".into(),
             ));
         }
+
         if !exe.is_file() {
             return Err(UglError::NotFound(format!("el archivo {}", exe.display())));
         }
-        let relative = exe.strip_prefix(&game.install_path).map_err(|_| {
+
+        let relative = exe.strip_prefix(&installation.install_path).map_err(|_| {
             UglError::Invalid(
                 "El ejecutable debe estar dentro de la carpeta de instalación del juego.".into(),
             )
         })?;
+
         registry::set_executable(self.db.conn(), id, &relative.to_string_lossy())?;
-        // El icono sale del ejecutable: se vuelve a extraer.
         registry::clear_icon(self.db.conn(), id)?;
+
         Ok(())
     }
 
-    /// Actualiza la carpeta de instalación (por ejemplo, si el usuario movió el juego). El ejecutable
-    /// se guarda como ruta relativa, así que sigue valiendo si la estructura interna no cambió.
+    /// Actualiza la carpeta de instalación de un juego.
     pub fn set_game_install_path(&mut self, id: GameId, new_dir: &Path) -> Result<()> {
         let game = registry::get_game(self.db.conn(), id)?;
-        if game.launch_kind != LaunchKind::Executable {
+        let installation = require_installation(&game)?;
+
+        if installation.launch_kind != LaunchKind::Executable {
             return Err(UglError::Invalid(
                 "La ubicación de los juegos de Steam la gestiona Steam; vuelve a importar tu carpeta de Steam."
                     .into(),
             ));
         }
+
         manual::validate_game_dir(new_dir)?;
         registry::set_install_path(self.db.conn(), id, &new_dir.to_string_lossy())
     }
@@ -840,6 +1066,12 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    fn installation(game: &Game) -> &Installation {
+        game.installation
+            .as_ref()
+            .expect("El juego de prueba debe tener una instalación")
+    }
 
     fn make_game_dir(root: &Path, name: &str) -> PathBuf {
         let dir = root.join(name);
@@ -894,7 +1126,10 @@ mod tests {
         core.set_game_executable(id, &dir.join("bin").join("otro.exe"))
             .unwrap();
         let game = core.game(id).unwrap();
-        assert_eq!(PathBuf::from(&game.launch_target), Path::new("bin").join("otro.exe"));
+        assert_eq!(
+            PathBuf::from(&installation(&game).launch_target),
+            Path::new("bin").join("otro.exe")
+        );
 
         assert!(core.set_game_executable(id, &outside).is_err());
     }
@@ -991,45 +1226,79 @@ mod tests {
         )
         .unwrap();
         let game = core.game(id).unwrap();
-        assert_eq!(game.launch_kind, LaunchKind::Executable);
-        assert_eq!(PathBuf::from(&game.launch_target), Path::new("bin").join("otro.exe"));
-        assert_eq!(game.launch_args, "-windowed -nolauncher");
-        assert_eq!(game.working_dir.as_deref(), Some(&*dir.to_string_lossy()));
+        assert_eq!(installation(&game).launch_kind, LaunchKind::Executable);
+        assert_eq!(
+            PathBuf::from(&installation(&game).launch_target),
+            Path::new("bin").join("otro.exe")
+        );
+        assert_eq!(installation(&game).launch_args, "-windowed -nolauncher");
+        assert_eq!(installation(&game).working_dir.as_deref(), Some(&*dir.to_string_lossy()));
 
         // Steam necesita un AppID; con él, el ejecutable sigue guardado.
         let err = core
-            .update_launch(id, &LaunchSettings { kind: LaunchKind::SteamUri, ..Default::default() })
+            .update_launch(
+                id,
+                &LaunchSettings {
+                    kind: LaunchKind::SteamUri,
+                    ..Default::default()
+                },
+            )
             .unwrap_err()
             .to_string();
         assert!(err.contains("AppID"));
         core.update_launch(
             id,
-            &LaunchSettings { kind: LaunchKind::SteamUri, steam_app_id: Some(440), ..Default::default() },
+            &LaunchSettings {
+                kind: LaunchKind::SteamUri,
+                steam_app_id: Some(440),
+                ..Default::default()
+            },
         )
         .unwrap();
         let game = core.game(id).unwrap();
-        assert_eq!(game.launch_kind, LaunchKind::SteamUri);
-        assert_eq!(game.launch_target, "440");
+        assert_eq!(installation(&game).launch_kind, LaunchKind::SteamUri);
+        assert_eq!(installation(&game).launch_target, "440");
         assert_eq!(game.steam_app_id, Some(440));
-        assert!(game.exe_path.is_some());
+        assert!(installation(&game).exe_path.is_some());
 
         // Otra plataforma: solo esquemas permitidos.
         assert!(core
-            .update_launch(id, &LaunchSettings { kind: LaunchKind::Uri, uri: Some("file:///x".into()), ..Default::default() })
+            .update_launch(
+                id,
+                &LaunchSettings {
+                    kind: LaunchKind::Uri,
+                    uri: Some("file:///x".into()),
+                    ..Default::default()
+                }
+            )
             .is_err());
         core.update_launch(
             id,
-            &LaunchSettings { kind: LaunchKind::Uri, uri: Some("goggalaxy://openGameView/1".into()), ..Default::default() },
+            &LaunchSettings {
+                kind: LaunchKind::Uri,
+                uri: Some("goggalaxy://openGameView/1".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
-        assert_eq!(core.game(id).unwrap().launch_kind, LaunchKind::Uri);
+        let game = core.game(id).unwrap();
+        assert_eq!(installation(&game).launch_kind, LaunchKind::Uri);
 
         // Y se puede volver al ejecutable directo sin volver a elegirlo.
-        core.update_launch(id, &LaunchSettings { kind: LaunchKind::Executable, ..Default::default() })
-            .unwrap();
+        core.update_launch(
+            id,
+            &LaunchSettings {
+                kind: LaunchKind::Executable,
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let game = core.game(id).unwrap();
-        assert_eq!(game.launch_kind, LaunchKind::Executable);
-        assert_eq!(PathBuf::from(&game.launch_target), Path::new("bin").join("otro.exe"));
+        assert_eq!(installation(&game).launch_kind, LaunchKind::Executable);
+        assert_eq!(
+            PathBuf::from(&installation(&game).launch_target),
+            Path::new("bin").join("otro.exe")
+        );
     }
 
     #[test]
@@ -1048,15 +1317,24 @@ mod tests {
 
         core.update_launch(
             id,
-            &LaunchSettings { kind: LaunchKind::Executable, exe: Some(outside.clone()), ..Default::default() },
+            &LaunchSettings {
+                kind: LaunchKind::Executable,
+                exe: Some(outside.clone()),
+                ..Default::default()
+            },
         )
         .unwrap();
-        assert_eq!(PathBuf::from(core.game(id).unwrap().launch_target), outside); // ruta absoluta
+        let game = core.game(id).unwrap();
+        assert_eq!(PathBuf::from(&installation(&game).launch_target), outside);
 
         assert!(core
             .update_launch(
                 id,
-                &LaunchSettings { kind: LaunchKind::Executable, exe: Some(lnk), ..Default::default() },
+                &LaunchSettings {
+                    kind: LaunchKind::Executable,
+                    exe: Some(lnk),
+                    ..Default::default()
+                },
             )
             .is_err());
     }
@@ -1098,14 +1376,17 @@ mod tests {
                 obj("display", obj("name", st("english", "First"))),
             ]),
         );
-        let schema = document(obj(
-            "220",
-            obj("stats", obj("1", obj("bits", bit))),
-        ));
+        let schema = document(obj("220", obj("stats", obj("1", obj("bits", bit)))));
         fs::write(stats_dir.join("UserGameStatsSchema_220.bin"), schema).unwrap();
         let progress = document(obj(
             "cache",
-            obj("1", cat(&[int("data", 1), obj("AchievementTimes", int("0", 1_700_000_000))])),
+            obj(
+                "1",
+                cat(&[
+                    int("data", 1),
+                    obj("AchievementTimes", int("0", 1_700_000_000)),
+                ]),
+            ),
         ));
         fs::write(stats_dir.join("UserGameStats_1_220.bin"), progress).unwrap();
 
@@ -1127,7 +1408,10 @@ mod tests {
         assert!(list[0].unlocked);
         assert_eq!(list[0].provenance, Provenance::Imported);
         let game = core.game(id).unwrap();
-        assert_eq!((game.achievements_unlocked, game.achievements_total), (1, 1));
+        assert_eq!(
+            (game.achievements_unlocked, game.achievements_total),
+            (1, 1)
+        );
     }
 
     #[test]
@@ -1204,12 +1488,20 @@ mod tests {
 
         core.associate_steam(id, 440).unwrap();
         let game = core.game(id).unwrap();
-        assert_eq!(game.launch_kind, LaunchKind::Executable); // sigue iniciándose por su .exe
+        assert_eq!(
+            installation(&game).launch_kind,
+            LaunchKind::Executable
+        ); // sigue iniciándose por su .exe
         assert_eq!(game.steam_app_id, Some(440));
         assert_eq!(core.find_steam_game(440), Some(id));
         assert_eq!(core.metadata_jobs(10).len(), 1);
 
-        let record = MetadataRecord { steam_app_id: 440, available: true, name: "Team Fortress 2".into(), ..Default::default() };
+        let record = MetadataRecord {
+            steam_app_id: 440,
+            available: true,
+            name: "Team Fortress 2".into(),
+            ..Default::default()
+        };
         core.save_metadata(id, &record).unwrap();
         assert!(core.metadata_jobs(10).is_empty());
         assert_eq!(core.metadata(id).unwrap().name, "Team Fortress 2");
@@ -1220,7 +1512,11 @@ mod tests {
         assert_eq!(core.metadata_jobs(10)[0].app_id, 570);
 
         // Con AppID conocido ya se pueden leer logros (aunque falte la carpeta de Steam, el error lo explica).
-        assert!(core.steam_achievement_job(id).unwrap_err().to_string().contains("Steam"));
+        assert!(core
+            .steam_achievement_job(id)
+            .unwrap_err()
+            .to_string()
+            .contains("Steam"));
     }
 
     #[test]
@@ -1240,7 +1536,10 @@ mod tests {
         let mut core = Core::open_in_memory().unwrap();
         // El usuario agrega el .exe a mano: se enlaza solo con el AppID por su ubicación.
         let preview = core.preview_import(&[game_dir.join("hl2.exe")]);
-        let items: Vec<(ImportCandidate, String)> = preview.into_iter().map(|c| (c, "HL2".to_string())).collect();
+        let items: Vec<(ImportCandidate, String)> = preview
+            .into_iter()
+            .map(|c| (c, "HL2".to_string()))
+            .collect();
         assert_eq!(core.import_candidates(&items).unwrap().added, 1);
         assert_eq!(core.list_games("").unwrap()[0].steam_app_id, Some(220));
 
@@ -1255,7 +1554,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = make_game_dir(tmp.path(), "Juego");
         let mut core = Core::open_in_memory().unwrap();
-        core.import_folder_game(&dir, "Juego", Path::new("bin/juego.exe")).unwrap();
+        core.import_folder_game(&dir, "Juego", Path::new("bin/juego.exe"))
+            .unwrap();
         let id = core.list_games("").unwrap()[0].id;
         core.rename_game(id, "  Nombre Oficial ").unwrap();
         assert_eq!(core.game(id).unwrap().title, "Nombre Oficial");
@@ -1286,11 +1586,14 @@ mod tests {
 
         // Una clave con mal formato se rechaza antes de guardar nada.
         assert!(core.link_itch_account("corta").is_err());
-        assert!(core.link_itch_account("una clave con espacios y \" comillas 1234567890").is_err());
+        assert!(core
+            .link_itch_account("una clave con espacios y \" comillas 1234567890")
+            .is_err());
         assert!(core.itch_account().is_none());
         assert!(core.itch_api_key().is_none());
 
-        core.save_itch_games(&[itch_game(1, "Juego Uno"), itch_game(2, "Juego Dos")]).unwrap();
+        core.save_itch_games(&[itch_game(1, "Juego Uno"), itch_game(2, "Juego Dos")])
+            .unwrap();
         assert_eq!(core.itch_counts(), (2, 2));
         assert!(core.last_itch_sync().is_some());
         assert_eq!(core.list_itch_games("uno").len(), 1);
@@ -1310,12 +1613,17 @@ mod tests {
         assert!(core.itch_account().is_some());
         assert_eq!(core.itch_api_key().as_deref(), Some(key));
         // En la base de datos no aparece en claro, y vincular una clave descarta la biblioteca anterior.
-        let stored = settings::get(core.db.conn(), settings::KEY_ITCH_KEY).unwrap().unwrap();
+        let stored = settings::get(core.db.conn(), settings::KEY_ITCH_KEY)
+            .unwrap()
+            .unwrap();
         assert!(!stored.contains(key));
         assert_eq!(core.itch_counts(), (0, 0));
 
         core.set_itch_username("  Ana ").unwrap();
-        assert_eq!(core.itch_account().unwrap().username.as_deref(), Some("Ana"));
+        assert_eq!(
+            core.itch_account().unwrap().username.as_deref(),
+            Some("Ana")
+        );
         core.unlink_itch_account().unwrap();
         assert!(core.itch_account().is_none() && core.itch_api_key().is_none());
     }
@@ -1325,11 +1633,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = make_game_dir(tmp.path(), "Mi Juego");
         let mut core = Core::open_in_memory().unwrap();
-        core.save_itch_games(&[itch_game(1, "Mi Juego"), itch_game(2, "Otro Juego")]).unwrap();
+        core.save_itch_games(&[itch_game(1, "Mi Juego"), itch_game(2, "Otro Juego")])
+            .unwrap();
         assert_eq!(core.list_itch_games("").len(), 2);
 
-        core.import_folder_game(&dir, "mi juego", Path::new("bin/juego.exe")).unwrap();
-        let pending: Vec<String> = core.list_itch_games("").into_iter().map(|g| g.title).collect();
+        core.import_folder_game(&dir, "mi juego", Path::new("bin/juego.exe"))
+            .unwrap();
+        let pending: Vec<String> = core
+            .list_itch_games("")
+            .into_iter()
+            .map(|g| g.title)
+            .collect();
         assert_eq!(pending, vec!["Otro Juego"]);
         assert_eq!(core.itch_counts(), (2, 1));
         assert!(core.show_itch_enabled());

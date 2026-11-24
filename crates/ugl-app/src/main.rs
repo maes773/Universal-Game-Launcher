@@ -1,5 +1,8 @@
 // En Windows y en modo release no se abre una consola detrás de la ventana.
-#![cfg_attr(all(not(debug_assertions), target_os = "windows"), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(not(debug_assertions), target_os = "windows"),
+    windows_subsystem = "windows"
+)]
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -8,16 +11,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
-use ugl_core::diagnostics;
-use ugl_core::integrations::manual::{self, FolderScan};
 use ugl_core::achievement_engine::AchievementView;
-use ugl_core::application::{LaunchOutcome, SteamAchievementJob};
+use ugl_core::application::{
+    LaunchOutcome, SteamAchievementJob, SteamLuaCandidate, SteamLuaCandidateStatus,
+};
+use ugl_core::diagnostics;
 use ugl_core::domain::{format_date, unix_now, ItchGame, LaunchSettings, MetadataRecord};
 use ugl_core::icons;
 use ugl_core::integrations::executables::{self, CandidateStatus, ImportCandidate};
+use ugl_core::integrations::itch;
+use ugl_core::integrations::manual::{self, FolderScan};
 use ugl_core::integrations::shortcut;
 use ugl_core::integrations::steam;
-use ugl_core::integrations::itch;
 use ugl_core::integrations::steam_achievements;
 use ugl_core::integrations::steam_store::{self, SearchHit};
 use ugl_core::process_manager;
@@ -40,6 +45,10 @@ struct PreviewEntry {
 struct AppState {
     core: Mutex<Core>,
     search: Mutex<String>,
+    /// Candidatos Lua descubiertos por el último análisis de Steam (uno por AppID).
+    pending_steam_lua_candidates: Mutex<Vec<SteamLuaCandidate>>,
+    /// AppID seleccionados en el diálogo Lua (solo los `Ready` pueden estarlo).
+    pending_lua_selected: Mutex<HashSet<u64>>,
     /// Resultado del último análisis de carpeta, a la espera de que el usuario confirme.
     pending_scan: Mutex<Option<FolderScan>>,
     /// Vista previa de la importación de ejecutables, a la espera de que el usuario confirme.
@@ -50,18 +59,19 @@ struct AppState {
     icon_worker_running: AtomicBool,
     /// Ídem para la descarga de fichas de Steam Store.
     metadata_worker_running: AtomicBool,
+    /// Ídem para la consulta de metadatos de candidatos Lua (una consulta a la vez).
+    lua_metadata_worker_running: AtomicBool,
     /// Resultados de la última búsqueda en Steam Store (asociación manual).
     link_results: Mutex<Vec<SearchHit>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 thread_local! {
-    // Imágenes ya decodificadas (solo en el hilo de la interfaz). Evita releer el disco en cada
-    // búsqueda o cambio de filtro. Solo se recuerdan las que existen: una que aparezca después
-    // (por ejemplo, tras descargarla) se cargará en el siguiente repintado.
     static IMAGE_CACHE: RefCell<HashMap<PathBuf, slint::Image>> = RefCell::new(HashMap::new());
 }
 
@@ -126,11 +136,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let state = Arc::new(AppState {
         core: Mutex::new(core),
         search: Mutex::new(String::new()),
+        pending_steam_lua_candidates: Mutex::new(Vec::new()),
+        pending_lua_selected: Mutex::new(HashSet::new()),
         pending_scan: Mutex::new(None),
         pending_preview: Mutex::new(Vec::new()),
         cache_dir: paths.cache_dir.clone(),
         icon_worker_running: AtomicBool::new(false),
         metadata_worker_running: AtomicBool::new(false),
+        lua_metadata_worker_running: AtomicBool::new(false),
         link_results: Mutex::new(Vec::new()),
     });
 
@@ -158,12 +171,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     wire_steam_link(&ui, &state);
     wire_background(&ui, &state);
     wire_account(&ui, &state);
+    wire_lua(&ui, &state);
+
     refresh_games(&ui, &state);
     refresh_account_ui(&ui, &state);
     restart_automation(&ui, &state);
     startup_sync(ui.as_weak(), state.clone());
 
-    // Cerrar la ventana (X) sale de UGL; para dejarlo en segundo plano está el botón de la bandeja.
     ui.window().on_close_requested(|| {
         TRAY.with(|slot| {
             *slot.borrow_mut() = None;
@@ -176,7 +190,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     ui.show()?;
-    // No `ui.run()`: así el programa sigue activo aunque la ventana esté oculta en la bandeja.
     slint::run_event_loop_until_quit()?;
 
     TRAY.with(|slot| {
@@ -204,7 +217,6 @@ fn source_label(source: &str) -> &'static str {
     }
 }
 
-/// «Valve · 16 NOV 2004 · Acción» a partir de la ficha de la tienda.
 fn metadata_info_line(record: &MetadataRecord) -> String {
     let developers = record.developers.join(", ");
     let genres = record.genres.join(", ");
@@ -216,19 +228,34 @@ fn metadata_info_line(record: &MetadataRecord) -> String {
 }
 
 fn launch_description(game: &Game) -> String {
-    match game.launch_kind {
+    let Some(installation) = game.installation.as_ref() else {
+        return "Sin instalación ni método de inicio configurado.".to_string();
+    };
+
+    match installation.launch_kind {
         LaunchKind::Executable => {
-            let mut text = format!("Ejecutable directo: {}", game.launch_target);
-            if !game.launch_args.trim().is_empty() {
-                text.push_str(&format!("  ·  Argumentos: {}", game.launch_args.trim()));
+            let mut text = format!("Ejecutable directo: {}", installation.launch_target);
+            if !installation.launch_args.trim().is_empty() {
+                text.push_str(&format!(
+                    "  ·  Argumentos: {}",
+                    installation.launch_args.trim()
+                ));
             }
-            if let Some(dir) = game.working_dir.as_deref().filter(|d| !d.is_empty()) {
+            if let Some(dir) = installation
+                .working_dir
+                .as_deref()
+                .filter(|d| !d.is_empty())
+            {
                 text.push_str(&format!("  ·  Carpeta de trabajo: {dir}"));
             }
             text
         }
-        LaunchKind::SteamUri => format!("Steam (AppID {})", game.launch_target),
-        LaunchKind::Uri => format!("Plataforma: {}", game.launch_target),
+        LaunchKind::SteamUri => {
+            format!("Steam (AppID {})", installation.launch_target)
+        }
+        LaunchKind::Uri => {
+            format!("Plataforma: {}", installation.launch_target)
+        }
     }
 }
 
@@ -268,9 +295,6 @@ fn refresh_games(ui: &MainWindow, state: &AppState) {
                 })
                 .collect();
 
-            // Con la cuenta de itch.io vinculada: también los juegos de tu biblioteca que no están
-            // instalados. En la lista llevan la inicial (sin imagen) para no gastar memoria; su portada se
-            // carga al abrirlos.
             let owned = {
                 let core = lock(&state.core);
                 if core.itch_account().is_some() && core.show_itch_enabled() {
@@ -333,22 +357,51 @@ fn show_detail(ui: &MainWindow, state: &AppState, id: GameId) {
     };
 
     let launch_text = launch_description(&game);
-    let (can_change_exe, can_change_path) = match game.launch_kind {
-        LaunchKind::Executable => (true, true),
-        LaunchKind::SteamUri | LaunchKind::Uri => (false, false),
+
+    let (can_change_exe, can_change_path) = match game
+        .installation
+        .as_ref()
+        .map(|installation| installation.launch_kind)
+    {
+        Some(LaunchKind::Executable) => (true, true),
+        Some(LaunchKind::SteamUri) | Some(LaunchKind::Uri) | None => (false, false),
     };
+
+    let install_path = game
+        .installation
+        .as_ref()
+        .map(|installation| installation.install_path.display().to_string())
+        .unwrap_or_else(|| "No instalado".to_string());
+
+    let can_show_achievements = game
+        .installation
+        .as_ref()
+        .map_or(false, |installation| {
+            installation.launch_kind == LaunchKind::SteamUri
+        })
+        || game.steam_app_id.is_some()
+        || game.achievements_total > 0;
+
     let metadata = lock(&state.core).metadata(id).filter(|m| m.available);
     let cover = metadata
         .as_ref()
         .and_then(|m| m.cover_path.as_deref())
         .and_then(|path| cached_image(Path::new(path)));
-    let store_name = metadata.as_ref().map(|m| m.name.clone()).unwrap_or_default();
+    let store_name = metadata
+        .as_ref()
+        .map(|m| m.name.clone())
+        .unwrap_or_default();
     let can_use_store_name = !store_name.is_empty() && store_name != game.title;
     let image = game_icon(&game);
+
     ui.set_detail(GameDetail {
         has_cover: cover.is_some(),
         cover: cover.unwrap_or_default(),
-        info: metadata.as_ref().map(metadata_info_line).unwrap_or_default().into(),
+        info: metadata
+            .as_ref()
+            .map(metadata_info_line)
+            .unwrap_or_default()
+            .into(),
         description: metadata
             .as_ref()
             .map(|m| m.short_description.clone())
@@ -362,16 +415,14 @@ fn show_detail(ui: &MainWindow, state: &AppState, id: GameId) {
         initial: initial_of(&game.title),
         title: game.title.clone().into(),
         source: source_label(&game.source).into(),
-        install_path: game.install_path.display().to_string().into(),
+        install_path: install_path.into(),
         launch_target: launch_text.into(),
         status: status.message().into(),
         can_change_exe,
         can_change_path,
         ach_total: game.achievements_total as i32,
         ach_unlocked: game.achievements_unlocked as i32,
-        can_show_achievements: game.launch_kind == LaunchKind::SteamUri
-            || game.steam_app_id.is_some()
-            || game.achievements_total > 0,
+        can_show_achievements,
     });
     ui.set_confirm_remove(false);
     ui.set_detail_visible(true);
@@ -449,7 +500,6 @@ fn wire_library(ui: &MainWindow, state: &Arc<AppState>) {
 // ---------------------------------------------------------------------------
 
 fn wire_import(ui: &MainWindow, state: &Arc<AppState>) {
-    // --- Juego individual: elegir carpeta ---
     ui.on_import_folder_clicked({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -485,7 +535,6 @@ fn wire_import(ui: &MainWindow, state: &Arc<AppState>) {
         }
     });
 
-    // --- Juego individual: buscar un ejecutable que el análisis no encontró ---
     ui.on_browse_exe_clicked({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -521,7 +570,6 @@ fn wire_import(ui: &MainWindow, state: &Arc<AppState>) {
         }
     });
 
-    // --- Juego individual: confirmar ---
     ui.on_import_confirm({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -540,12 +588,11 @@ fn wire_import(ui: &MainWindow, state: &Arc<AppState>) {
                 else {
                     return;
                 };
-                let result = lock(&state.core).import_folder_game(
+                lock(&state.core).import_folder_game(
                     &scan.install_dir,
                     name.as_str(),
                     &candidate.relative,
-                );
-                result
+                )
             };
             match outcome {
                 Ok(summary) => {
@@ -562,7 +609,6 @@ fn wire_import(ui: &MainWindow, state: &Arc<AppState>) {
                     kick_icon_worker(ui.as_weak(), state.clone());
                 }
                 Err(err) => {
-                    // El diálogo sigue abierto para que el usuario pueda corregir.
                     diagnostics::warn(&format!("No se pudo importar el juego: {err}"));
                     set_status(&ui, format!("No se pudo importar: {err}"));
                 }
@@ -582,7 +628,6 @@ fn wire_import(ui: &MainWindow, state: &Arc<AppState>) {
         }
     });
 
-    // --- Carpeta de Steam ---
     ui.on_import_steam_clicked({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -630,7 +675,6 @@ fn on_folder_scanned(
             lock(&state.core).remember_import_dir(folder);
             ui.set_import_folder(scan.install_dir.display().to_string().into());
             ui.set_import_name(scan.suggested_name.clone().into());
-            // Se preselecciona solo si hay una propuesta razonable; si no, el usuario decide.
             let selected = if scan.candidates.first().map_or(false, |c| c.suggested) {
                 0
             } else {
@@ -668,41 +712,293 @@ fn on_steam_scanned(
     }
 
     let result = lock(&state.core).import_steam(&scan);
-    match result {
-        Ok(summary) => {
-            lock(&state.core).remember_import_dir(folder);
-            let mut message = if scan.games.is_empty() {
-                "No se encontraron juegos instalados en esa carpeta de Steam.".to_string()
-            } else {
-                format!(
-                    "Steam: {} juego(s) nuevo(s), {} ya estaban en la biblioteca, {} actualizado(s).",
-                    summary.added, summary.already_present, summary.updated
-                )
-            };
-            if scan.skipped_not_installed > 0 {
-                message.push_str(&format!(
-                    " {} sin instalar, omitido(s).",
-                    scan.skipped_not_installed
-                ));
-            }
-            if !scan.warnings.is_empty() {
-                message.push_str(&format!(
-                    " Hubo {} aviso(s); consulta el registro.",
-                    scan.warnings.len()
-                ));
-            }
-            set_status(ui, message);
-            ui.set_current_view(0);
-            refresh_games(ui, state);
-            // Ya se conocen las carpetas de Steam: se vigilan y se buscan los iconos.
-            restart_automation(ui, state);
-            kick_icon_worker(ui.as_weak(), state.clone());
-        }
+    let summary = match result {
+        Ok(summary) => summary,
         Err(err) => {
-            diagnostics::error(&format!("No se pudo guardar la importación de Steam: {err}"));
+            diagnostics::error(&format!(
+                "No se pudo guardar la importación de Steam: {err}"
+            ));
             set_status(ui, format!("No se pudo guardar la importación: {err}"));
+            return;
         }
+    };
+
+    lock(&state.core).remember_import_dir(folder);
+
+    let mut message = if scan.games.is_empty() {
+        "No se encontraron juegos instalados en esa carpeta de Steam.".to_string()
+    } else {
+        format!(
+            "Steam: {} juego(s) nuevo(s), {} ya estaban en la biblioteca, {} actualizado(s).",
+            summary.added, summary.already_present, summary.updated
+        )
+    };
+    if scan.skipped_not_installed > 0 {
+        message.push_str(&format!(
+            " {} sin instalar, omitido(s).",
+            scan.skipped_not_installed
+        ));
     }
+    if !scan.warnings.is_empty() {
+        message.push_str(&format!(
+            " Hubo {} aviso(s); consulta el registro.",
+            scan.warnings.len()
+        ));
+    }
+
+    set_status(ui, message);
+    ui.set_current_view(0);
+    refresh_games(ui, state);
+    restart_automation(ui, state);
+    kick_icon_worker(ui.as_weak(), state.clone());
+
+    // Descubrimiento Lua: se hace en segundo plano con el `scan` ya movido
+    // al hilo. Las consultas a Steam Store no bloquean el hilo de la interfaz.
+    start_lua_candidates(ui, state, scan);
+}
+
+// ---------------------------------------------------------------------------
+// Descubrimiento Steam Lua → incorporación de juegos no instalados
+// ---------------------------------------------------------------------------
+
+/// Lanza en segundo plano la consulta de metadatos de los AppID encontrados en los
+/// archivos `.lua`. Al terminar, `show_lua_candidates` pinta el diálogo de selección.
+/// Si ya hay una consulta en curso, esta se descarta (indicador `lua_metadata_worker_running`).
+fn start_lua_candidates(
+    ui: &MainWindow,
+    state: &Arc<AppState>,
+    scan: steam::SteamScan,
+) {
+    if state.lua_metadata_worker_running.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let weak = ui.as_weak();
+    let state = state.clone();
+    std::thread::spawn(move || {
+        let work_dir = state.cache_dir.join("tmp");
+        let _ = std::fs::create_dir_all(&work_dir);
+        let result = lock(&state.core).fetch_steam_lua_metadata(&scan, &work_dir);
+        state.lua_metadata_worker_running.store(false, Ordering::SeqCst);
+
+        let candidates = match result {
+            Ok(c) => c,
+            Err(err) => {
+                diagnostics::warn(&format!(
+                    "No se pudieron consultar candidatos Lua: {err}"
+                ));
+                return;
+            }
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let _ = weak.upgrade_in_event_loop(move |ui| {
+            show_lua_candidates(&ui, &state, candidates);
+        });
+    });
+}
+
+/// Filtra lo que ya está en la biblioteca, prepara la selección por defecto
+/// (todos los `Ready` seleccionados), guarda el estado y pinta el diálogo.
+fn show_lua_candidates(
+    ui: &MainWindow,
+    state: &AppState,
+    candidates: Vec<SteamLuaCandidate>,
+) {
+    // Defensa: `fetch_steam_lua_metadata` ya filtra, pero si algo cambió entre medias
+    // (por ejemplo, una importación anterior), lo descartamos aquí.
+    let candidates: Vec<SteamLuaCandidate> = {
+        let core = lock(&state.core);
+        candidates
+            .into_iter()
+            .filter(|c| core.find_steam_game(c.app_id).is_none())
+            .collect()
+    };
+    if candidates.is_empty() {
+        return;
+    }
+
+    let selected: HashSet<u64> = candidates
+        .iter()
+        .filter(|c| matches!(c.status, SteamLuaCandidateStatus::Ready(_)))
+        .map(|c| c.app_id)
+        .collect();
+
+    *lock(&state.pending_steam_lua_candidates) = candidates;
+    *lock(&state.pending_lua_selected) = selected;
+
+    render_lua_candidates(ui, state);
+    ui.set_steam_lua_dialog_visible(true);
+}
+
+/// Vuelca el estado a la interfaz Slint: convierte cada `SteamLuaCandidate` en un
+/// `SteamLuaItem` y actualiza el resumen y el contador de selección.
+fn render_lua_candidates(ui: &MainWindow, state: &AppState) {
+    let candidates = lock(&state.pending_steam_lua_candidates);
+    let selected = lock(&state.pending_lua_selected);
+
+    let items: Vec<SteamLuaItem> = candidates
+        .iter()
+        .map(|c| {
+            let (name, status, detail, selectable) = match &c.status {
+                SteamLuaCandidateStatus::Ready(info) => {
+                    let name = if info.name.trim().is_empty() {
+                        format!("AppID {}", c.app_id)
+                    } else {
+                        info.name.clone()
+                    };
+                    (
+                        name,
+                        "Disponible".to_string(),
+                        "Juego de Steam".to_string(),
+                        true,
+                    )
+                }
+                SteamLuaCandidateStatus::Unavailable => (
+                    format!("AppID {}", c.app_id),
+                    "Sin ficha".to_string(),
+                    "Steam no ofrece información pública para este AppID.".to_string(),
+                    false,
+                ),
+                SteamLuaCandidateStatus::NotGame { product_type } => (
+                    format!("AppID {}", c.app_id),
+                    "No es un juego".to_string(),
+                    format!("Tipo de producto: {product_type}"),
+                    false,
+                ),
+                SteamLuaCandidateStatus::Failed { message } => (
+                    format!("AppID {}", c.app_id),
+                    "Error".to_string(),
+                    message.clone(),
+                    false,
+                ),
+            };
+
+            SteamLuaItem {
+                app_id: c.app_id.to_string().into(),
+                name: name.into(),
+                status: status.into(),
+                detail: detail.into(),
+                include: selectable && selected.contains(&c.app_id),
+                selectable,
+            }
+        })
+        .collect();
+
+    let count = items
+        .iter()
+        .filter(|i| i.selectable && i.include)
+        .count();
+    drop(candidates);
+    drop(selected);
+
+    ui.set_steam_lua_items(ModelRc::new(VecModel::from(items)));
+    ui.set_steam_lua_selected(count as i32);
+    ui.set_steam_lua_busy(false);
+    ui.set_steam_lua_summary(
+        format!(
+            "{count} juego(s) listo(s) para añadir a la biblioteca. \
+             UGL no instala ni descarga los juegos; solo registra el AppID."
+        )
+        .into(),
+    );
+}
+
+/// Conecta los tres callbacks del diálogo Lua con la lógica de `Core`.
+fn wire_lua(ui: &MainWindow, state: &Arc<AppState>) {
+    ui.on_steam_lua_toggled({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move |index, checked| {
+            let app_id = {
+                let candidates = lock(&state.pending_steam_lua_candidates);
+                match usize::try_from(index)
+                    .ok()
+                    .and_then(|i| candidates.get(i))
+                {
+                    Some(c) if matches!(c.status, SteamLuaCandidateStatus::Ready(_)) => c.app_id,
+                    _ => return,
+                }
+            };
+            {
+                let mut selected = lock(&state.pending_lua_selected);
+                if checked {
+                    selected.insert(app_id);
+                } else {
+                    selected.remove(&app_id);
+                }
+            }
+            if let Some(ui) = weak.upgrade() {
+                render_lua_candidates(&ui, &state);
+            }
+        }
+    });
+
+    ui.on_steam_lua_cancel({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            lock(&state.pending_steam_lua_candidates).clear();
+            lock(&state.pending_lua_selected).clear();
+            if let Some(ui) = weak.upgrade() {
+                ui.set_steam_lua_dialog_visible(false);
+                set_status(&ui, "");
+            }
+        }
+    });
+
+    ui.on_steam_lua_confirm({
+        let weak = ui.as_weak();
+        let state = state.clone();
+        move || {
+            let Some(ui) = weak.upgrade() else {
+                return;
+            };
+
+            let candidates = lock(&state.pending_steam_lua_candidates).clone();
+            let selected_ids: Vec<u64> = lock(&state.pending_lua_selected)
+                .iter()
+                .copied()
+                .collect();
+
+            if selected_ids.is_empty() {
+                set_status(&ui, "No hay ningún juego seleccionado.");
+                return;
+            }
+
+            let result = lock(&state.core)
+                .register_steam_lua_candidates(&candidates, &selected_ids);
+
+            match result {
+                Ok(summary) => {
+                    lock(&state.pending_steam_lua_candidates).clear();
+                    lock(&state.pending_lua_selected).clear();
+                    ui.set_steam_lua_dialog_visible(false);
+
+                    let mut message = format!(
+                        "{} juego(s) añadido(s) a la biblioteca.",
+                        summary.added
+                    );
+                    if summary.already_present > 0 {
+                        message.push_str(&format!(
+                            " {} ya estaba(n).",
+                            summary.already_present
+                        ));
+                    }
+                    set_status(&ui, message);
+                    ui.set_current_view(0);
+                    refresh_games(&ui, &state);
+                    kick_icon_worker(ui.as_weak(), state.clone());
+                }
+                Err(err) => {
+                    diagnostics::warn(&format!(
+                        "No se pudieron registrar los candidatos Lua: {err}"
+                    ));
+                    set_status(&ui, format!("No se pudo añadir: {err}"));
+                }
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -725,7 +1021,13 @@ fn wire_detail(ui: &MainWindow, state: &Arc<AppState>) {
         let state = state.clone();
         move |id| {
             let id = id as GameId;
-            let start_dir = lock(&state.core).game(id).ok().map(|g| g.install_path);
+            let start_dir = lock(&state.core)
+                .game(id)
+                .ok()
+                .and_then(|game| {
+                    game.installation
+                        .map(|installation| installation.install_path)
+                });
             let weak = weak.clone();
             let state = state.clone();
             std::thread::spawn(move || {
@@ -795,7 +1097,10 @@ fn wire_detail(ui: &MainWindow, state: &Arc<AppState>) {
                     Ok(()) => {
                         ui.set_detail_visible(false);
                         ui.set_confirm_remove(false);
-                        set_status(&ui, "Juego quitado de la biblioteca (no se borró ningún archivo).");
+                        set_status(
+                            &ui,
+                            "Juego quitado de la biblioteca (no se borró ningún archivo).",
+                        );
                         refresh_games(&ui, &state);
                     }
                     Err(err) => set_status(&ui, format!("No se pudo quitar el juego: {err}")),
@@ -810,7 +1115,6 @@ fn wire_detail(ui: &MainWindow, state: &Arc<AppState>) {
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    // La ventana de logros solo existe en el hilo de la interfaz y se reutiliza.
     static ACH_WINDOW: RefCell<Option<AchievementsWindow>> = RefCell::new(None);
 }
 
@@ -884,7 +1188,10 @@ fn open_achievements(main_ui: &MainWindow, state: &Arc<AppState>, id: GameId) {
         Ok(win) => win,
         Err(err) => {
             diagnostics::error(&format!("No se pudo crear la ventana de logros: {err}"));
-            set_status(main_ui, format!("No se pudo abrir la ventana de logros: {err}"));
+            set_status(
+                main_ui,
+                format!("No se pudo abrir la ventana de logros: {err}"),
+            );
             return;
         }
     };
@@ -893,11 +1200,13 @@ fn open_achievements(main_ui: &MainWindow, state: &Arc<AppState>, id: GameId) {
     win.set_status_text("".into());
     render_achievements(&win, state);
     if let Err(err) = win.show() {
-        set_status(main_ui, format!("No se pudo mostrar la ventana de logros: {err}"));
+        set_status(
+            main_ui,
+            format!("No se pudo mostrar la ventana de logros: {err}"),
+        );
         return;
     }
 
-    // Primera vez: se intenta leer la caché local de Steam automáticamente.
     let has_any = lock(&state.core)
         .achievements(id)
         .map_or(false, |list| !list.is_empty());
@@ -950,7 +1259,6 @@ fn render_achievements(win: &AchievementsWindow, state: &AppState) {
 fn achievement_item(view: &AchievementView) -> AchievementItem {
     let hidden_locked = view.hidden && !view.unlocked;
 
-    // Bloqueado: icono gris si existe; si no, el de color (la interfaz lo atenúa).
     let path = if view.unlocked {
         view.icon.as_ref()
     } else {
@@ -1015,8 +1323,6 @@ fn start_achievement_refresh(
     });
 }
 
-/// Avisa a la interfaz de que los logros de un juego cambiaron: repinta la biblioteca (insignias)
-/// y, si la ventana de logros muestra ese juego, también la lista.
 fn notify_achievements(
     main: &slint::Weak<MainWindow>,
     state: &Arc<AppState>,
@@ -1041,8 +1347,6 @@ fn notify_achievements(
     });
 }
 
-/// Lee, guarda y completa con imágenes los logros de un juego de Steam. Bloquea: ejecutar siempre
-/// en un hilo aparte (lo hacen el botón «Actualizar» y el vigilante de carpetas).
 fn refresh_achievements_blocking(
     main: &slint::Weak<MainWindow>,
     state: &Arc<AppState>,
@@ -1054,7 +1358,9 @@ fn refresh_achievements_blocking(
     let mut set = match steam_achievements::read_local_achievements(&job.steam_root, job.app_id) {
         Ok(set) => set,
         Err(err) => {
-            diagnostics::warn(&format!("No se pudieron leer los logros del juego {id}: {err}"));
+            diagnostics::warn(&format!(
+                "No se pudieron leer los logros del juego {id}: {err}"
+            ));
             notify_achievements(
                 main,
                 state,
@@ -1069,7 +1375,6 @@ fn refresh_achievements_blocking(
         diagnostics::warn(&format!("Logros de Steam: {warning}"));
     }
 
-    // 1) Guardar enseguida, con las imágenes que ya estén en disco.
     let local = steam_achievements::resolve_missing_icons(&mut set, &state.cache_dir, false);
     let saved = lock(&state.core).save_steam_achievements(id, &set);
     if let Err(err) = saved {
@@ -1098,7 +1403,6 @@ fn refresh_achievements_blocking(
     }
     notify_achievements(main, state, id, Some(message), downloading);
 
-    // 2) Descargar las imágenes que falten, sin bloquear la interfaz.
     if downloading {
         let report = steam_achievements::resolve_missing_icons(&mut set, &state.cache_dir, true);
         if report.downloaded > 0 {
@@ -1124,17 +1428,14 @@ fn refresh_achievements_blocking(
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    // El vigilante vive en el hilo de la interfaz; al soltarlo se detiene todo.
     static STEAM_WATCHER: RefCell<Option<SteamWatcher>> = RefCell::new(None);
 }
 
-/// (Re)inicia la vigilancia según las preferencias y las carpetas de Steam conocidas.
 fn restart_automation(ui: &MainWindow, state: &Arc<AppState>) {
     let (enabled, dirs) = {
         let core = lock(&state.core);
         (core.auto_update_enabled(), core.steam_watch_dirs())
     };
-    // Primero se detiene la anterior (si la hay).
     STEAM_WATCHER.with(|slot| {
         *slot.borrow_mut() = None;
     });
@@ -1155,7 +1456,6 @@ fn restart_automation(ui: &MainWindow, state: &Arc<AppState>) {
     }
 }
 
-/// Se ejecuta en el hilo del vigilante, ya sin ráfagas repetidas.
 fn handle_watch_event(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>, event: WatchEvent) {
     match event {
         WatchEvent::LibraryChanged => sync_steam_library(weak, state),
@@ -1165,7 +1465,6 @@ fn handle_watch_event(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>, eve
                 core.find_steam_game(app_id)
                     .map(|id| (id, core.steam_achievement_job(id)))
             };
-            // Solo juegos que están en la biblioteca.
             if let Some((id, Ok(job))) = prepared {
                 refresh_achievements_blocking(weak, state, id, &job);
             }
@@ -1173,8 +1472,6 @@ fn handle_watch_event(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>, eve
     }
 }
 
-/// Vuelve a leer los manifiestos de Steam e importa lo que sea nuevo. Bloquea (hilo aparte).
-/// Solo mira archivos `appmanifest`: es una lectura ligera, no un escaneo de los juegos.
 fn sync_steam_library(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>) {
     let root = lock(&state.core).steam_root();
     let Some(root) = root else {
@@ -1201,7 +1498,9 @@ fn sync_steam_library(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>) {
     let summary = match result {
         Ok(summary) => summary,
         Err(err) => {
-            diagnostics::warn(&format!("No se pudo actualizar la biblioteca de Steam: {err}"));
+            diagnostics::warn(&format!(
+                "No se pudo actualizar la biblioteca de Steam: {err}"
+            ));
             return;
         }
     };
@@ -1226,13 +1525,12 @@ fn sync_steam_library(weak: &slint::Weak<MainWindow>, state: &Arc<AppState>) {
             restart_automation(&ui, &state);
         }
         kick_icon_worker(ui.as_weak(), state.clone());
+        // Al reescanear, también buscamos .lua nuevos para juegos sin instalar.
+        start_lua_candidates(&ui, &state, scan);
     });
 }
 
-/// Busca en segundo plano el icono de los juegos que aún no lo tienen. Si ya hay un extractor
-/// trabajando, no hace nada (ese mismo repasará los juegos nuevos al terminar su tanda).
 fn kick_icon_worker(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
-    // Toda alta de juegos pasa por aquí: se aprovecha para pedir también las fichas de la tienda.
     kick_metadata_worker(weak.clone(), state.clone());
     if state.icon_worker_running.swap(true, Ordering::SeqCst) {
         return;
@@ -1284,8 +1582,6 @@ fn kick_icon_worker(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
     });
 }
 
-/// Al arrancar: se ponen al día los juegos y logros que cambiaron con UGL cerrado y se buscan
-/// los iconos pendientes. Todo en segundo plano.
 fn startup_sync(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
     std::thread::spawn(move || {
         let auto = lock(&state.core).auto_update_enabled();
@@ -1299,7 +1595,8 @@ fn startup_sync(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
         kick_icon_worker(weak.clone(), state.clone());
         if auto {
             let state_for_ui = state.clone();
-            let _ = weak.upgrade_in_event_loop(move |ui| maybe_auto_sync_account(&ui, &state_for_ui));
+            let _ =
+                weak.upgrade_in_event_loop(move |ui| maybe_auto_sync_account(&ui, &state_for_ui));
         }
     });
 }
@@ -1340,7 +1637,10 @@ fn wire_settings(ui: &MainWindow, state: &Arc<AppState>) {
                     set_status(&ui, "Se descargarán las fichas públicas de Steam Store.");
                     kick_metadata_worker(ui.as_weak(), state.clone());
                 } else {
-                    set_status(&ui, "UGL no consultará Steam Store: usará solo las fichas ya guardadas.");
+                    set_status(
+                        &ui,
+                        "UGL no consultará Steam Store: usará solo las fichas ya guardadas.",
+                    );
                 }
             }
         }
@@ -1394,7 +1694,6 @@ fn wire_settings(ui: &MainWindow, state: &Arc<AppState>) {
 // ---------------------------------------------------------------------------
 
 fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
-    // Varios .exe (o .lnk/.url) a la vez.
     ui.on_import_exes_clicked({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -1428,7 +1727,6 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
         }
     });
 
-    // Accesos directos de una carpeta (así no se pierden sus argumentos).
     ui.on_import_shortcuts_clicked({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -1453,7 +1751,10 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
                 let _ = weak.upgrade_in_event_loop(move |ui| {
                     ui.set_busy(false);
                     if paths.is_empty() {
-                        set_status(&ui, "No se encontraron accesos directos (.lnk/.url) en esa carpeta.");
+                        set_status(
+                            &ui,
+                            "No se encontraron accesos directos (.lnk/.url) en esa carpeta.",
+                        );
                     } else {
                         start_preview(&ui, &state, paths);
                     }
@@ -1468,10 +1769,7 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
         move |index, include| {
             {
                 let mut entries = lock(&state.pending_preview);
-                if let Some(entry) = usize::try_from(index)
-                    .ok()
-                    .and_then(|i| entries.get_mut(i))
-                {
+                if let Some(entry) = usize::try_from(index).ok().and_then(|i| entries.get_mut(i)) {
                     if entry.candidate.status == CandidateStatus::New {
                         entry.include = include;
                     }
@@ -1483,15 +1781,11 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
         }
     });
 
-    // Editar un nombre solo cambia el estado interno (no se repinta: así no se pierde el foco).
     ui.on_preview_name_edited({
         let state = state.clone();
         move |index, text| {
             let mut entries = lock(&state.pending_preview);
-            if let Some(entry) = usize::try_from(index)
-                .ok()
-                .and_then(|i| entries.get_mut(i))
-            {
+            if let Some(entry) = usize::try_from(index).ok().and_then(|i| entries.get_mut(i)) {
                 entry.name = text.to_string();
             }
         }
@@ -1531,7 +1825,8 @@ fn wire_preview(ui: &MainWindow, state: &Arc<AppState>) {
                     lock(&state.pending_preview).clear();
                     ui.set_preview_visible(false);
                     ui.set_current_view(0);
-                    let mut message = format!("{} juego(s) añadido(s) a la biblioteca.", summary.added);
+                    let mut message =
+                        format!("{} juego(s) añadido(s) a la biblioteca.", summary.added);
                     if summary.already_present > 0 {
                         message.push_str(&format!(" {} ya estaba(n).", summary.already_present));
                     }
@@ -1574,7 +1869,6 @@ fn render_preview(ui: &MainWindow, state: &AppState) {
                 CandidateStatus::Duplicate => ("Duplicado", 1),
                 CandidateStatus::Invalid => ("No válido", 2),
             };
-            // Para los válidos, el detalle muestra el ejecutable real y los argumentos detectados.
             let note = if !candidate.note.is_empty() {
                 candidate.note.clone()
             } else if candidate.kind == LaunchKind::SteamUri {
@@ -1749,6 +2043,7 @@ fn wire_launch(ui: &MainWindow, state: &Arc<AppState>) {
 
 fn open_launch_dialog(ui: &MainWindow, state: &AppState, id: GameId) {
     let loaded = lock(&state.core).game(id);
+
     let game = match loaded {
         Ok(game) => game,
         Err(err) => {
@@ -1756,17 +2051,39 @@ fn open_launch_dialog(ui: &MainWindow, state: &AppState, id: GameId) {
             return;
         }
     };
-    let exe = game
-        .exe_path
-        .as_deref()
-        .filter(|path| !path.is_empty())
-        .map(|path| game.install_path.join(path).display().to_string())
+
+    let installation = game.installation.as_ref();
+
+    let launch_kind = installation
+        .map(|installation| installation.launch_kind)
         .unwrap_or_default();
-    let uri = if game.launch_kind == LaunchKind::Uri {
-        game.launch_target.clone()
-    } else {
-        String::new()
-    };
+
+    let exe = installation
+        .and_then(|installation| installation.exe_path.as_deref())
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            installation
+                .unwrap()
+                .install_path
+                .join(path)
+                .display()
+                .to_string()
+        })
+        .unwrap_or_default();
+
+    let uri = installation
+        .filter(|installation| installation.launch_kind == LaunchKind::Uri)
+        .map(|installation| installation.launch_target.clone())
+        .unwrap_or_default();
+
+    let launch_args = installation
+        .map(|installation| installation.launch_args.clone())
+        .unwrap_or_default();
+
+    let working_dir = installation
+        .and_then(|installation| installation.working_dir.clone())
+        .unwrap_or_default();
+
     let steam_id = game
         .steam_app_id
         .map(|app_id| app_id.to_string())
@@ -1774,17 +2091,16 @@ fn open_launch_dialog(ui: &MainWindow, state: &AppState, id: GameId) {
 
     ui.set_launch_game_id(id as i32);
     ui.set_launch_game_title(game.title.clone().into());
-    ui.set_launch_method(game.launch_kind.index());
+    ui.set_launch_method(launch_kind.index());
     ui.set_launch_exe(exe.into());
-    ui.set_launch_args(game.launch_args.clone().into());
-    ui.set_launch_workdir(game.working_dir.clone().unwrap_or_default().into());
+    ui.set_launch_args(launch_args.into());
+    ui.set_launch_workdir(working_dir.into());
     ui.set_launch_steam_id(steam_id.into());
     ui.set_launch_uri(uri.into());
     ui.set_launch_error("".into());
     ui.set_launch_dialog_visible(true);
 }
 
-/// Si se elige un acceso directo, se usa su ejecutable real, sus argumentos y su directorio de trabajo.
 fn apply_picked_executable(ui: &MainWindow, file: &Path) {
     if !shortcut::is_shortcut(file) {
         ui.set_launch_exe(file.display().to_string().into());
@@ -1813,8 +2129,6 @@ fn apply_picked_executable(ui: &MainWindow, file: &Path) {
 // Fichas de Steam Store (guardadas en local) y asociación manual
 // ---------------------------------------------------------------------------
 
-/// Descarga en segundo plano la ficha pública de los juegos con AppID que aún no la tienen.
-/// Un fallo de red no se guarda: se reintentará la próxima vez.
 fn kick_metadata_worker(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
     if !lock(&state.core).fetch_metadata_enabled() {
         return;
@@ -1853,7 +2167,6 @@ fn kick_metadata_worker(weak: slint::Weak<MainWindow>, state: Arc<AppState>) {
                         job.app_id
                     )),
                 }
-                // Cortesía con el servidor: una petición cada medio segundo como máximo.
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
 
@@ -1932,7 +2245,6 @@ fn wire_steam_link(ui: &MainWindow, state: &Arc<AppState>) {
             let state = state.clone();
             std::thread::spawn(move || {
                 let work_dir = state.cache_dir.join("tmp");
-                // Un número se trata como AppID; cualquier otra cosa, como nombre a buscar.
                 let outcome: Result<Vec<SearchHit>, String> = match query.parse::<u64>() {
                     Ok(app_id) => match steam_store::fetch_info(app_id, &work_dir) {
                         Ok(Some(info)) => Ok(vec![SearchHit {
@@ -1959,7 +2271,10 @@ fn wire_steam_link(ui: &MainWindow, state: &Arc<AppState>) {
                                 if hits.is_empty() {
                                     "No se encontró nada con ese nombre o AppID.".to_string()
                                 } else {
-                                    format!("{} resultado(s). Elige el correcto y pulsa Asociar.", hits.len())
+                                    format!(
+                                        "{} resultado(s). Elige el correcto y pulsa Asociar.",
+                                        hits.len()
+                                    )
                                 }
                                 .into(),
                             );
@@ -1968,7 +2283,8 @@ fn wire_steam_link(ui: &MainWindow, state: &Arc<AppState>) {
                             ui.set_link_results(ModelRc::new(VecModel::from(items)));
                         }
                         Err(message) => ui.set_link_status(
-                            format!("No se pudo consultar Steam Store (¿sin conexión?): {message}").into(),
+                            format!("No se pudo consultar Steam Store (¿sin conexión?): {message}")
+                                .into(),
                         ),
                     }
                 });
@@ -2050,8 +2366,6 @@ fn wire_steam_link(ui: &MainWindow, state: &Arc<AppState>) {
 // ---------------------------------------------------------------------------
 
 thread_local! {
-    // La ventana principal y la bandeja solo existen en el hilo de la interfaz. Los manejadores de
-    // la bandeja se limitan a pedir, con `invoke_from_event_loop`, que se actúe sobre ellas.
     static MAIN_WINDOW: RefCell<Option<MainWindow>> = RefCell::new(None);
     static TRAY: RefCell<Option<tray::Tray>> = RefCell::new(None);
 }
@@ -2075,7 +2389,6 @@ fn on_tray_quit() {
     });
 }
 
-/// Oculta UGL y deja su icono en la bandeja. Sin bandeja disponible, lo minimiza normalmente.
 fn minimize_to_tray(ui: &MainWindow) -> bool {
     let already = TRAY.with(|slot| slot.borrow().is_some());
     let ready = already || {
@@ -2118,7 +2431,6 @@ fn minimize_to_tray(ui: &MainWindow) -> bool {
     ready
 }
 
-/// Vuelve a mostrar UGL y quita su icono de la bandeja.
 fn restore_from_tray(ui: &MainWindow) {
     TRAY.with(|slot| {
         *slot.borrow_mut() = None;
@@ -2138,7 +2450,6 @@ fn wire_background(ui: &MainWindow, _state: &Arc<AppState>) {
     });
 }
 
-/// Al iniciar un juego: UGL pasa a segundo plano y, cuando el juego se cierra, vuelve solo.
 fn begin_background_session(ui: &MainWindow, state: &Arc<AppState>, outcome: LaunchOutcome) {
     minimize_to_tray(ui);
 
@@ -2160,7 +2471,8 @@ fn begin_background_session(ui: &MainWindow, state: &Arc<AppState>, outcome: Lau
                     format!("No se detectó el proceso de «{title}»; UGL vuelve a mostrarse.")
                 }
                 SessionEnd::Unsupported => {
-                    "No se puede seguir el juego en este sistema; UGL vuelve a mostrarse.".to_string()
+                    "No se puede seguir el juego en este sistema; UGL vuelve a mostrarse."
+                        .to_string()
                 }
             };
             set_status(&ui, message);
@@ -2180,7 +2492,6 @@ fn owned_source_line(game: &ItchGame) -> String {
     }
 }
 
-/// Pinta en la vista «Cuenta de itch.io» lo que UGL sabe: cuenta y última sincronización.
 fn refresh_account_ui(ui: &MainWindow, state: &AppState) {
     let (account, counts, last_sync, show) = {
         let core = lock(&state.core);
@@ -2207,7 +2518,10 @@ fn refresh_account_ui(ui: &MainWindow, state: &AppState) {
                 .clone()
                 .unwrap_or_else(|| "tu cuenta de itch.io".to_string());
             ui.set_account_status(
-                format!("Cuenta vinculada: {who}. La clave está guardada y cifrada en este equipo.").into(),
+                format!(
+                    "Cuenta vinculada: {who}. La clave está guardada y cifrada en este equipo."
+                )
+                .into(),
             );
             ui.set_account_sync_status(
                 match last_sync {
@@ -2226,7 +2540,6 @@ fn refresh_account_ui(ui: &MainWindow, state: &AppState) {
 }
 
 fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
-    // --- Vincular con la clave de la API ---
     ui.on_account_save_key({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -2302,7 +2615,6 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
         }
     });
 
-    // --- Juegos de la biblioteca de itch.io que no están instalados ---
     ui.on_owned_clicked({
         let weak = ui.as_weak();
         let state = state.clone();
@@ -2338,7 +2650,6 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
             ui.set_owned_cover(cover.unwrap_or_default());
             ui.set_owned_dialog_visible(true);
 
-            // La portada se descarga solo al abrir el juego (bajo demanda).
             let missing = cover_file.as_ref().map_or(false, |path| !path.is_file());
             if missing && game.cover_url.is_some() {
                 let weak = weak.clone();
@@ -2346,7 +2657,9 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
                 std::thread::spawn(move || {
                     if let Ok(path) = itch::ensure_cover(&game, &state.cache_dir) {
                         let _ = weak.upgrade_in_event_loop(move |ui| {
-                            if ui.get_owned_dialog_visible() && ui.get_owned_app_id() as u64 == game_id {
+                            if ui.get_owned_dialog_visible()
+                                && ui.get_owned_app_id() as u64 == game_id
+                            {
                                 if let Ok(image) = slint::Image::load_from_path(&path) {
                                     ui.set_owned_cover(image);
                                     ui.set_owned_has_cover(true);
@@ -2389,7 +2702,6 @@ fn wire_account(ui: &MainWindow, state: &Arc<AppState>) {
     });
 }
 
-/// Trae de itch.io el nombre de usuario y la lista de juegos de la biblioteca, en un hilo aparte.
 fn start_account_sync(ui: &MainWindow, state: &Arc<AppState>) {
     let (linked, key) = {
         let core = lock(&state.core);
@@ -2421,7 +2733,6 @@ fn start_account_sync(ui: &MainWindow, state: &Arc<AppState>) {
             }
             match games {
                 Ok(list) if list.is_empty() => {
-                    // No se pisa lo que ya había.
                     refresh_account_ui(&ui, &state);
                     ui.set_account_sync_status(
                         "itch.io no devolvió ningún juego: tu biblioteca puede estar vacía o la clave no tiene acceso."
@@ -2446,7 +2757,6 @@ fn start_account_sync(ui: &MainWindow, state: &Arc<AppState>) {
     });
 }
 
-/// Al arrancar: si hay cuenta vinculada y la última sincronización tiene más de 12 horas, se repite.
 fn maybe_auto_sync_account(ui: &MainWindow, state: &Arc<AppState>) {
     let due = {
         let core = lock(&state.core);

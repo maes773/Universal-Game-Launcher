@@ -31,12 +31,22 @@ pub fn get_with_bearer(url: &str, token: &str) -> Result<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        return Err(UglError::Invalid("La clave tiene caracteres no válidos.".into()));
+        return Err(UglError::Invalid(
+            "La clave tiene caracteres no válidos.".into(),
+        ));
     }
 
     let mut command = Command::new(CURL);
     command
-        .args(["--silent", "--show-error", "--max-time", "30", "--config", "-", url])
+        .args([
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "30",
+            "--config",
+            "-",
+            url,
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

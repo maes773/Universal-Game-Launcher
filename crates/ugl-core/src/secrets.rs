@@ -45,9 +45,7 @@ pub fn unprotect(_data: &[u8]) -> Result<Vec<u8>> {
 
 #[cfg(not(windows))]
 fn unsupported() -> UglError {
-    UglError::Invalid(
-        "El guardado cifrado de la clave solo está disponible en Windows.".into(),
-    )
+    UglError::Invalid("El guardado cifrado de la clave solo está disponible en Windows.".into())
 }
 
 #[cfg(windows)]

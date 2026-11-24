@@ -3,10 +3,11 @@
 use rusqlite::{params, Connection, OptionalExtension, Row};
 
 use crate::domain::{
-    unix_now, DiscoveredGame, Game, GameId, ItchGame, LaunchKind, MetadataRecord, RegisterSummary,
-    SortOrder,
+    unix_now, DiscoveredGame, Game, GameId, Installation, ItchGame, LaunchKind, MetadataRecord,
+    RegisterSummary, SortOrder,
 };
 use crate::error::{Result, UglError};
+
 
 const GAME_SELECT: &str = "
 SELECT g.id,
@@ -25,43 +26,70 @@ SELECT g.id,
        i.exe_path,
        i.launch_args,
        i.working_dir,
-       i.steam_app_id
+       i.steam_app_id,
+       (SELECT external_id FROM game_sources
+         WHERE game_id = g.id AND provider = 'steam'
+         ORDER BY id LIMIT 1)
 FROM games g
 JOIN platforms p ON p.id = g.platform_id
-JOIN installations i ON i.id = (
-    SELECT id FROM installations WHERE game_id = g.id AND is_primary = 1 ORDER BY id LIMIT 1
+LEFT JOIN installations i ON i.id = (
+    SELECT id FROM installations
+    WHERE game_id = g.id AND is_primary = 1
+    ORDER BY id LIMIT 1
 )
 ";
 
 fn map_game(row: &Row<'_>) -> rusqlite::Result<Game> {
-    let kind_text: String = row.get(5)?;
-    let launch_kind = LaunchKind::parse(&kind_text).ok_or_else(|| {
-        rusqlite::Error::InvalidColumnType(
-            5,
-            "launch_kind".to_string(),
-            rusqlite::types::Type::Text,
-        )
-    })?;
-    let install_path: String = row.get(4)?;
+    let install_path: Option<String> = row.get(4)?;
+
+    let installation = match install_path {
+        Some(path) => {
+            let kind_text: String = row.get(5)?;
+            let launch_kind = LaunchKind::parse(&kind_text).ok_or_else(|| {
+                rusqlite::Error::InvalidColumnType(
+                    5,
+                    "launch_kind".to_string(),
+                    rusqlite::types::Type::Text,
+                )
+            })?;
+
+            Some(Installation {
+                install_path: path.into(),
+                launch_kind,
+                launch_target: row.get(6)?,
+                exe_path: row.get(12)?,
+                launch_args: row.get(13)?,
+                working_dir: row.get(14)?,
+                steam_app_id: row.get::<_, Option<i64>>(15)?.map(|id| id as u64),
+            })
+        }
+        None => None,
+    };
+
+    // Para juegos no instalados, el AppID procede de game_sources.
+    // Para instalaciones existentes, prevalece el AppID guardado en la instalación.
+    let installation_app_id = installation
+        .as_ref()
+        .and_then(|install| install.steam_app_id);
+
+    let source_app_id: Option<String> = row.get(16)?;
+    let source_app_id = source_app_id.and_then(|id| id.parse::<u64>().ok());
+
     Ok(Game {
         id: row.get(0)?,
         title: row.get(1)?,
         platform: row.get(2)?,
         source: row.get(3)?,
-        install_path: install_path.into(),
-        launch_kind,
-        launch_target: row.get(6)?,
+        installation,
         added_at: row.get(7)?,
         last_played_at: row.get(8)?,
         achievements_total: row.get::<_, i64>(9)? as u32,
         achievements_unlocked: row.get::<_, i64>(10)? as u32,
         icon_path: row.get(11)?,
-        exe_path: row.get(12)?,
-        launch_args: row.get(13)?,
-        working_dir: row.get(14)?,
-        steam_app_id: row.get::<_, Option<i64>>(15)?.map(|id| id as u64),
+        steam_app_id: installation_app_id.or(source_app_id),
     })
 }
+
 
 fn escape_like(text: &str) -> String {
     text.replace('\\', "\\\\")
@@ -115,18 +143,55 @@ pub fn register(conn: &mut Connection, games: &[DiscoveredGame]) -> Result<Regis
 
         match existing {
             Some(game_id) => {
-                // Los juegos de Steam cambian de biblioteca al moverse; los manuales conservan
-                // la ruta que el usuario haya fijado.
-                let refreshed = game.launch_kind == LaunchKind::SteamUri
-                    && tx.execute(
-                        "UPDATE installations SET install_path = ?1
-                         WHERE game_id = ?2 AND is_primary = 1 AND install_path <> ?1",
-                        params![install_path, game_id],
-                    )? > 0;
-                if refreshed {
-                    summary.updated += 1;
+                let has_primary_installation: bool = tx.query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM installations
+                        WHERE game_id = ?1 AND is_primary = 1
+                    )",
+                    params![game_id],
+                    |row| row.get(0),
+                )?;
+
+                if has_primary_installation {
+                    // Los juegos de Steam pueden cambiar de biblioteca.
+                    // Los juegos manuales conservan la ruta elegida por el usuario.
+                    let refreshed = game.launch_kind == LaunchKind::SteamUri
+                        && tx.execute(
+                            "UPDATE installations
+                             SET install_path = ?1
+                             WHERE game_id = ?2
+                               AND is_primary = 1
+                               AND install_path <> ?1",
+                            params![install_path, game_id],
+                        )? > 0;
+
+                    if refreshed {
+                        summary.updated += 1;
+                    } else {
+                        summary.already_present += 1;
+                    }
                 } else {
-                    summary.already_present += 1;
+                    // El juego ya estaba en UGL, pero todavía no tenía instalación.
+                    // Ahora que se ha detectado instalado, registramos su instalación.
+                    tx.execute(
+                        "INSERT INTO installations
+                             (game_id, install_path, launch_kind, launch_target, exe_path,
+                              launch_args, working_dir, steam_app_id, is_primary, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9)",
+                        params![
+                            game_id,
+                            install_path,
+                            game.launch_kind.as_str(),
+                            game.launch_target,
+                            game.exe_path,
+                            game.launch_args,
+                            game.working_dir,
+                            game.steam_app_id.map(|id| id as i64),
+                            now
+                        ],
+                    )?;
+
+                    summary.updated += 1;
                 }
             }
             None => {
@@ -177,6 +242,69 @@ pub fn register(conn: &mut Connection, games: &[DiscoveredGame]) -> Result<Regis
     tx.commit()?;
     Ok(summary)
 }
+
+
+/// Registra un juego descubierto mediante el catálogo local de Steam,
+/// aunque todavía no tenga una instalación.
+///
+/// No crea filas en `installations`: el juego se podrá instalar posteriormente
+/// delegando la operación al cliente oficial de Steam.
+pub fn register_uninstalled_steam_game(
+    conn: &mut Connection,
+    app_id: u64,
+    title: &str,
+) -> Result<RegisterSummary> {
+    let tx = conn.transaction()?;
+    let mut summary = RegisterSummary::default();
+
+    let external_id = app_id.to_string();
+
+    let existing: Option<GameId> = tx
+        .query_row(
+            "SELECT game_id FROM game_sources
+             WHERE provider = 'steam' AND external_id = ?1",
+            params![external_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    if existing.is_some() {
+        summary.already_present += 1;
+        tx.commit()?;
+        return Ok(summary);
+    }
+
+    let platform_id: i64 = tx
+        .query_row(
+            "SELECT id FROM platforms WHERE slug = 'pc'",
+            params![],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| UglError::Invalid("Plataforma desconocida: pc".to_string()))?;
+
+    let now = unix_now();
+
+    tx.execute(
+        "INSERT INTO games (title, sort_title, platform_id, added_at)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![title, title.to_lowercase(), platform_id, now],
+    )?;
+
+    let game_id = tx.last_insert_rowid();
+
+    tx.execute(
+        "INSERT INTO game_sources (game_id, provider, external_id)
+         VALUES (?1, 'steam', ?2)",
+        params![game_id, external_id],
+    )?;
+
+    summary.added += 1;
+
+    tx.commit()?;
+    Ok(summary)
+}
+
 
 pub fn touch_last_played(conn: &Connection, id: GameId) -> Result<()> {
     conn.execute(
@@ -242,7 +370,11 @@ pub fn save_metadata(conn: &Connection, game_id: GameId, record: &MetadataRecord
         params![
             game_id,
             record.steam_app_id as i64,
-            if record.available { "ok" } else { "unavailable" },
+            if record.available {
+                "ok"
+            } else {
+                "unavailable"
+            },
             record.name,
             record.short_description,
             join_list(&record.developers),
@@ -284,27 +416,51 @@ pub fn get_metadata(conn: &Connection, game_id: GameId) -> Result<Option<Metadat
 }
 
 pub fn delete_metadata(conn: &Connection, game_id: GameId) -> Result<()> {
-    conn.execute("DELETE FROM game_metadata WHERE game_id = ?1", params![game_id])?;
+    conn.execute(
+        "DELETE FROM game_metadata WHERE game_id = ?1",
+        params![game_id],
+    )?;
     Ok(())
 }
 
 /// Juegos con AppID conocido cuya ficha aún no está guardada (o es de otro AppID).
+
+/// Juegos con AppID conocido cuya ficha aún no está guardada
+/// (o cuya ficha corresponde a otro AppID).
+///
+/// Reconoce tanto AppID asociados a instalaciones como juegos
+/// Steam registrados sin instalar.
 pub fn games_needing_metadata(conn: &Connection, limit: usize) -> Result<Vec<(GameId, u64)>> {
     let mut stmt = conn.prepare_cached(
-        "SELECT i.game_id, i.steam_app_id
-         FROM installations i
-         JOIN games g ON g.id = i.game_id
-         LEFT JOIN game_metadata m ON m.game_id = i.game_id AND m.steam_app_id = i.steam_app_id
-         WHERE i.is_primary = 1 AND i.steam_app_id IS NOT NULL AND g.hidden = 0 AND m.game_id IS NULL
-         ORDER BY i.game_id
+        "SELECT g.id,
+                COALESCE(i.steam_app_id, CAST(s.external_id AS INTEGER)) AS app_id
+         FROM games g
+         LEFT JOIN installations i
+             ON i.id = (
+                 SELECT id FROM installations
+                 WHERE game_id = g.id AND is_primary = 1
+                 ORDER BY id LIMIT 1
+             )
+         LEFT JOIN game_sources s
+             ON s.game_id = g.id AND s.provider = 'steam'
+         LEFT JOIN game_metadata m
+             ON m.game_id = g.id
+            AND m.steam_app_id = COALESCE(i.steam_app_id, CAST(s.external_id AS INTEGER))
+         WHERE g.hidden = 0
+           AND COALESCE(i.steam_app_id, CAST(s.external_id AS INTEGER)) IS NOT NULL
+           AND m.game_id IS NULL
+         ORDER BY g.id
          LIMIT ?1",
     )?;
+
     let rows = stmt.query_map(params![limit as i64], |row| {
         Ok((row.get::<_, GameId>(0)?, row.get::<_, i64>(1)? as u64))
     })?;
+
     let jobs = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(jobs)
 }
+
 
 /// Asocia (o desasocia) un juego con una ficha de Steam sin cambiar su método de inicio.
 pub fn set_steam_app_id(conn: &Connection, id: GameId, app_id: Option<u64>) -> Result<()> {
@@ -318,17 +474,26 @@ pub fn set_steam_app_id(conn: &Connection, id: GameId, app_id: Option<u64>) -> R
     Ok(())
 }
 
+
 pub fn find_game_by_steam_app_id(conn: &Connection, app_id: u64) -> Result<Option<GameId>> {
+    let external_id = app_id.to_string();
+
     let found = conn
         .query_row(
-            "SELECT game_id FROM installations
-             WHERE steam_app_id = ?1 AND is_primary = 1 ORDER BY game_id LIMIT 1",
-            params![app_id as i64],
+            "SELECT game_id FROM game_sources
+             WHERE provider = 'steam' AND external_id = ?1
+             UNION
+             SELECT game_id FROM installations
+             WHERE steam_app_id = ?2 AND is_primary = 1
+             LIMIT 1",
+            params![external_id, app_id as i64],
             |row| row.get(0),
         )
         .optional()?;
+
     Ok(found)
 }
+
 
 pub fn rename_game(conn: &Connection, id: GameId, title: &str) -> Result<()> {
     let changed = conn.execute(
@@ -466,17 +631,31 @@ pub fn set_icon_path(conn: &Connection, id: GameId, path: &str) -> Result<()> {
 
 /// Olvida el icono para que se vuelva a extraer (por ejemplo, tras cambiar el ejecutable).
 pub fn clear_icon(conn: &Connection, id: GameId) -> Result<()> {
-    conn.execute("UPDATE games SET icon_path = NULL WHERE id = ?1", params![id])?;
+    conn.execute(
+        "UPDATE games SET icon_path = NULL WHERE id = ?1",
+        params![id],
+    )?;
     Ok(())
 }
 
 pub fn games_without_icon(conn: &Connection, limit: usize) -> Result<Vec<Game>> {
     let sql = format!(
-        "{GAME_SELECT} WHERE g.hidden = 0 AND g.icon_path IS NULL ORDER BY g.id LIMIT ?1"
+        "{GAME_SELECT}
+         WHERE g.hidden = 0
+           AND g.icon_path IS NULL
+           AND EXISTS (
+               SELECT 1
+               FROM installations ix
+               WHERE ix.game_id = g.id
+           )
+         ORDER BY g.id
+         LIMIT ?1"
     );
+
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(params![limit as i64], map_game)?;
     let games = rows.collect::<rusqlite::Result<Vec<Game>>>()?;
+
     Ok(games)
 }
 
@@ -548,8 +727,13 @@ mod tests {
         .unwrap();
         assert_eq!(summary.updated, 1);
 
-        let game = list_games(db.conn(), "", SortOrder::Title).unwrap().remove(0);
-        assert_eq!(game.install_path, PathBuf::from("D:\\Lib\\common\\HL2"));
+        let game = list_games(db.conn(), "", SortOrder::Title)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+    game.installation.as_ref().unwrap().install_path,
+    PathBuf::from("D:\\Lib\\common\\HL2")
+);
     }
 
     #[test]
@@ -577,7 +761,9 @@ mod tests {
 
         let installs: i64 = db
             .conn()
-            .query_row("SELECT COUNT(*) FROM installations", params![], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM installations", params![], |r| {
+                r.get(0)
+            })
             .unwrap();
         let sources: i64 = db
             .conn()
@@ -596,7 +782,10 @@ mod tests {
         assert_eq!(games_without_icon(db.conn(), 10).unwrap().len(), 1);
         set_icon_path(db.conn(), id, "").unwrap(); // se intentó y no hay icono
         assert!(games_without_icon(db.conn(), 10).unwrap().is_empty());
-        assert_eq!(get_game(db.conn(), id).unwrap().icon_path.as_deref(), Some(""));
+        assert_eq!(
+            get_game(db.conn(), id).unwrap().icon_path.as_deref(),
+            Some("")
+        );
 
         clear_icon(db.conn(), id).unwrap();
         assert_eq!(games_without_icon(db.conn(), 10).unwrap().len(), 1);
@@ -606,8 +795,12 @@ mod tests {
     fn finds_a_game_by_its_source() {
         let mut db = Database::open_in_memory().unwrap();
         register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
-        assert!(find_game_by_source(db.conn(), "steam", "220").unwrap().is_some());
-        assert!(find_game_by_source(db.conn(), "steam", "999").unwrap().is_none());
+        assert!(find_game_by_source(db.conn(), "steam", "220")
+            .unwrap()
+            .is_some());
+        assert!(find_game_by_source(db.conn(), "steam", "999")
+            .unwrap()
+            .is_none());
     }
 
     fn sample_record(app_id: u64) -> MetadataRecord {
@@ -631,14 +824,23 @@ mod tests {
         register(db.conn_mut(), &[steam_game(220, "Half-Life 2", "C:\\a")]).unwrap();
         let id = list_games(db.conn(), "", SortOrder::Title).unwrap()[0].id;
 
-        assert_eq!(games_needing_metadata(db.conn(), 10).unwrap(), vec![(id, 220)]);
+        assert_eq!(
+            games_needing_metadata(db.conn(), 10).unwrap(),
+            vec![(id, 220)]
+        );
         save_metadata(db.conn(), id, &sample_record(220)).unwrap();
         assert!(games_needing_metadata(db.conn(), 10).unwrap().is_empty());
-        assert_eq!(get_metadata(db.conn(), id).unwrap(), Some(sample_record(220)));
+        assert_eq!(
+            get_metadata(db.conn(), id).unwrap(),
+            Some(sample_record(220))
+        );
 
         // Cambiar la asociación manualmente obliga a pedir la ficha nueva.
         set_steam_app_id(db.conn(), id, Some(70)).unwrap();
-        assert_eq!(games_needing_metadata(db.conn(), 10).unwrap(), vec![(id, 70)]);
+        assert_eq!(
+            games_needing_metadata(db.conn(), 10).unwrap(),
+            vec![(id, 70)]
+        );
         delete_metadata(db.conn(), id).unwrap();
         assert!(get_metadata(db.conn(), id).unwrap().is_none());
     }
@@ -648,7 +850,11 @@ mod tests {
         let mut db = Database::open_in_memory().unwrap();
         register(db.conn_mut(), &[steam_game(5, "X", "C:\\a")]).unwrap();
         let id = list_games(db.conn(), "", SortOrder::Title).unwrap()[0].id;
-        let record = MetadataRecord { steam_app_id: 5, available: false, ..Default::default() };
+        let record = MetadataRecord {
+            steam_app_id: 5,
+            available: false,
+            ..Default::default()
+        };
         save_metadata(db.conn(), id, &record).unwrap();
         assert!(games_needing_metadata(db.conn(), 10).unwrap().is_empty());
         assert!(!get_metadata(db.conn(), id).unwrap().unwrap().available);
@@ -659,7 +865,11 @@ mod tests {
     #[test]
     fn renaming_keeps_the_sort_title_in_sync() {
         let mut db = Database::open_in_memory().unwrap();
-        register(db.conn_mut(), &[steam_game(1, "zzz", "C:\\a"), steam_game(2, "mmm", "C:\\b")]).unwrap();
+        register(
+            db.conn_mut(),
+            &[steam_game(1, "zzz", "C:\\a"), steam_game(2, "mmm", "C:\\b")],
+        )
+        .unwrap();
         let id = list_games(db.conn(), "zzz", SortOrder::Title).unwrap()[0].id;
         rename_game(db.conn(), id, "Aaa Nuevo").unwrap();
         let first = list_games(db.conn(), "", SortOrder::Title).unwrap();
@@ -680,7 +890,15 @@ mod tests {
     #[test]
     fn itch_games_hide_what_is_already_in_the_library_by_title() {
         let mut db = Database::open_in_memory().unwrap();
-        replace_itch_games(db.conn_mut(), &[itch(1, "Celeste Clon"), itch(2, "Zeta Quest"), itch(3, "alfa")]).unwrap();
+        replace_itch_games(
+            db.conn_mut(),
+            &[
+                itch(1, "Celeste Clon"),
+                itch(2, "Zeta Quest"),
+                itch(3, "alfa"),
+            ],
+        )
+        .unwrap();
         assert_eq!(count_itch_games(db.conn()).unwrap(), (3, 3));
 
         // «Alfa» ya está instalado (aunque con otras mayúsculas): deja de ser «no instalado».
@@ -711,7 +929,10 @@ mod tests {
         let mut db = Database::open_in_memory().unwrap();
         register(
             db.conn_mut(),
-            &[steam_game(1, "Alfa", "C:\\a"), steam_game(2, "Beta", "C:\\b")],
+            &[
+                steam_game(1, "Alfa", "C:\\a"),
+                steam_game(2, "Beta", "C:\\b"),
+            ],
         )
         .unwrap();
         let beta = list_games(db.conn(), "beta", SortOrder::Title).unwrap()[0].id;
@@ -719,5 +940,46 @@ mod tests {
 
         let ordered = list_games(db.conn(), "", SortOrder::RecentlyPlayed).unwrap();
         assert_eq!(ordered[0].title, "Beta");
+    }
+
+    #[test]
+    fn uninstalled_steam_game_gets_installation_when_later_discovered() {
+        let mut db = Database::open_in_memory().unwrap();
+
+        // Primero registramos el juego sin instalación.
+        let first = register_uninstalled_steam_game(
+            db.conn_mut(),
+            220,
+            "Half-Life 2",
+        )
+        .unwrap();
+
+        assert_eq!(first.added, 1);
+
+        let game = list_games(db.conn(), "", SortOrder::Title)
+            .unwrap()
+            .remove(0);
+
+        assert!(game.installation.is_none());
+        assert_eq!(game.steam_app_id, Some(220));
+
+        // Después Steam detecta que el juego ya está instalado.
+        let second = register(
+            db.conn_mut(),
+            &[steam_game(220, "Half-Life 2", "D:\\SteamLibrary\\common\\Half-Life 2")],
+        )
+        .unwrap();
+
+        assert_eq!(second.updated, 1);
+
+        let game = list_games(db.conn(), "", SortOrder::Title)
+            .unwrap()
+            .remove(0);
+
+        assert!(game.installation.is_some());
+        assert_eq!(
+            game.installation.unwrap().install_path,
+            PathBuf::from("D:\\SteamLibrary\\common\\Half-Life 2")
+        );
     }
 }

@@ -59,6 +59,15 @@ export struct PreviewItem {
     selectable: bool,
 }
 
+export struct SteamLuaItem {
+    app-id: string,
+    name: string,
+    status: string,
+    detail: string,
+    include: bool,
+    selectable: bool,
+}
+
 export struct AchievementItem {
     name: string,
     description: string,
@@ -240,6 +249,13 @@ export component MainWindow inherits Window {
     in property <string> preview-summary;
     in property <int> preview-selected: 0;
 
+    // Descubrimiento de juegos mediante Steam Lua
+    in property <bool> steam-lua-dialog-visible: false;
+    in property <[SteamLuaItem]> steam-lua-items;
+    in property <string> steam-lua-summary;
+    in property <int> steam-lua-selected: 0;
+    in property <bool> steam-lua-busy: false;
+
     // Cuenta de itch.io (opcional)
     in-out property <bool> show-owned: true;
     in property <bool> account-linked: false;
@@ -305,6 +321,9 @@ export component MainWindow inherits Window {
     callback preview-name-edited(int, string);
     callback preview-confirm();
     callback preview-cancel();
+    callback steam-lua-toggled(int, bool);
+    callback steam-lua-confirm();
+    callback steam-lua-cancel();
     callback launch-settings-clicked(int);
     callback launch-browse-exe();
     callback launch-browse-workdir();
@@ -817,6 +836,148 @@ export component MainWindow inherits Window {
                         primary: true;
                         enabled: root.selected-exe >= 0 && root.import-name != "";
                         clicked => { root.import-confirm(root.import-name, root.selected-exe); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Selección de juegos descubiertos mediante Steam Lua ----
+    if root.steam-lua-dialog-visible : Rectangle {
+        background: #000000c0;
+
+        TouchArea { }
+
+        Rectangle {
+            width: Math.min(820px, parent.width - 48px);
+            height: Math.min(620px, parent.height - 48px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #2a1f18;
+            border-radius: 12px;
+            border-width: 1px;
+            border-color: #4a3626;
+
+            VerticalLayout {
+                padding: 20px;
+                spacing: 10px;
+
+                Text {
+                    text: "Juegos encontrados en Steam";
+                    color: #f2e6d4;
+                    font-size: 21px;
+                    font-weight: 700;
+                }
+
+                Text {
+                    text: root.steam-lua-summary;
+                    color: #b9a58e;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+
+                Text {
+                    text: "Selecciona los juegos que quieras incorporar. UGL no instala ni descarga los juegos.";
+                    color: #8a7662;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                }
+
+                ListView {
+                    vertical-stretch: 1;
+
+                    for item[i] in root.steam-lua-items : Rectangle {
+                        height: 76px;
+                        border-radius: 6px;
+                        background: item.selectable
+                            ? (item-area.has-hover ? #36281d : #2f2218)
+                            : #221813;
+
+                        item-area := TouchArea { }
+
+                        HorizontalLayout {
+                            padding: 10px;
+                            spacing: 12px;
+
+                            CheckBox {
+                                enabled: item.selectable && !root.steam-lua-busy;
+                                checked: item.include;
+                                toggled => {
+                                    root.steam-lua-toggled(i, self.checked);
+                                }
+                            }
+
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                alignment: center;
+                                spacing: 3px;
+
+                                Text {
+                                    text: item.name;
+                                    color: item.selectable ? #f2e6d4 : #8a7662;
+                                    font-size: 14px;
+                                    font-weight: 700;
+                                    overflow: elide;
+                                }
+
+                                Text {
+                                    text: "AppID: " + item.app-id;
+                                    color: #8a7662;
+                                    font-size: 10px;
+                                }
+
+                                Text {
+                                    text: item.detail;
+                                    color: #b9a58e;
+                                    font-size: 11px;
+                                    overflow: elide;
+                                }
+                            }
+
+                            Text {
+                                width: 125px;
+                                text: item.status;
+                                color: item.selectable ? #7fc15b : #d9825b;
+                                font-size: 11px;
+                                font-weight: 700;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 8px;
+
+                    Text {
+                        text: root.steam-lua-selected + " juego(s) seleccionado(s)";
+                        color: #e8b96a;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+
+                    Button {
+                        text: "Cancelar";
+                        enabled: !root.steam-lua-busy;
+                        clicked => {
+                            root.steam-lua-cancel();
+                        }
+                    }
+
+                    Button {
+                        text: root.steam-lua-busy ? "Añadiendo..." : "Añadir seleccionados";
+                        primary: true;
+                        enabled: root.steam-lua-selected > 0
+                            && !root.steam-lua-busy;
+                        clicked => {
+                            root.steam-lua-confirm();
+                        }
                     }
                 }
             }

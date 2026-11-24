@@ -35,6 +35,8 @@ pub struct SteamScan {
     /// Manifiestos cuya carpeta de instalación no existe (descarga incompleta o juego borrado).
     pub skipped_not_installed: usize,
     pub skipped_ignored: usize,
+    pub lua_app_ids: Vec<u64>,
+    pub lua_app_ids_not_installed: Vec<u64>,
     pub warnings: Vec<String>,
 }
 
@@ -89,6 +91,8 @@ struct Manifest {
     /// `StateFlags` de Steam: el bit 4 indica «instalado por completo».
     state_flags: Option<u32>,
 }
+
+
 
 fn app_id_from_file_name(file_name: &str) -> Option<u64> {
     let digits: String = file_name
@@ -166,6 +170,62 @@ fn steam_root_from_selection(selected: &Path) -> PathBuf {
     }
 }
 
+/// Escanea `config/lua` y extrae los AppID de los nombres de archivos `.lua`.
+///
+/// No lee ni ejecuta el contenido de los archivos.
+pub fn scan_lua_app_ids(steam_root: &Path) -> std::io::Result<Vec<u64>> {
+    let lua_dir = steam_root.join("config").join("lua");
+
+    let entries = match fs::read_dir(&lua_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Vec::new());
+        }
+        Err(err) => return Err(err),
+    };
+
+    let mut app_ids = HashSet::new();
+
+    for entry in entries {
+        let entry = entry?;
+
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+
+        let path = entry.path();
+
+        let is_lua = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map_or(false, |ext| ext.eq_ignore_ascii_case("lua"));
+
+        if !is_lua {
+            continue;
+        }
+
+        let Some(stem) = path.file_stem().and_then(|name| name.to_str()) else {
+            continue;
+        };
+
+        // El nombre completo debe ser numérico.
+        if !stem.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        if let Ok(app_id) = stem.parse::<u64>() {
+            if app_id > 0 {
+                app_ids.insert(app_id);
+            }
+        }
+    }
+
+    let mut result: Vec<u64> = app_ids.into_iter().collect();
+    result.sort_unstable();
+
+    Ok(result)
+}
+
 fn push_unique(list: &mut Vec<PathBuf>, path: PathBuf) {
     let key = path_key(&path);
     if !list.iter().any(|p| path_key(p) == key) {
@@ -178,11 +238,16 @@ fn push_unique(list: &mut Vec<PathBuf>, path: PathBuf) {
 /// enlazado con su ficha sin preguntar nada.
 pub fn app_id_for_path(path: &Path) -> Option<u64> {
     let components: Vec<Component<'_>> = path.components().collect();
-    let common_index = components.iter().enumerate().position(|(index, component)| {
-        index > 0
-            && component.as_os_str().eq_ignore_ascii_case("common")
-            && components[index - 1].as_os_str().eq_ignore_ascii_case("steamapps")
-    })?;
+    let common_index = components
+        .iter()
+        .enumerate()
+        .position(|(index, component)| {
+            index > 0
+                && component.as_os_str().eq_ignore_ascii_case("common")
+                && components[index - 1]
+                    .as_os_str()
+                    .eq_ignore_ascii_case("steamapps")
+        })?;
     let steamapps: PathBuf = components[..common_index].iter().collect();
     let folder = components
         .get(common_index + 1)?
@@ -340,14 +405,41 @@ pub fn scan_steam_folder(selected: &Path) -> Result<SteamScan> {
             .then(a.app_id.cmp(&b.app_id))
     });
 
+    // 3. AppID de archivos Lua: se leen únicamente los nombres, nunca su contenido.
+    let lua_app_ids = match scan_lua_app_ids(&root) {
+        Ok(app_ids) => app_ids,
+        Err(err) => {
+            warnings.push(format!("No se pudo leer config/lua: {err}"));
+            Vec::new()
+        }
+    };
+
+    // 4. Separa los AppID Lua que no corresponden a juegos instalados detectados.
+    let installed_app_ids: Vec<u64> = games.iter().map(|game| game.app_id).collect();
+    let lua_app_ids_not_installed =
+        find_uninstalled_lua_app_ids(&lua_app_ids, &installed_app_ids);
+
     Ok(SteamScan {
         steam_root: root,
         libraries,
         games,
         skipped_not_installed,
         skipped_ignored,
+        lua_app_ids,
+        lua_app_ids_not_installed,
         warnings,
     })
+}
+
+fn find_uninstalled_lua_app_ids(
+    lua_app_ids: &[u64],
+    installed_app_ids: &[u64],
+) -> Vec<u64> {
+    lua_app_ids
+        .iter()
+        .copied()
+        .filter(|app_id| !installed_app_ids.contains(app_id))
+        .collect()
 }
 
 #[cfg(test)]
@@ -363,6 +455,31 @@ mod tests {
     const ACF_NOT_INSTALLED: &str = "\"AppState\"\n{\n\t\"appid\"\t\t\"999\"\n\t\"name\"\t\t\"Fantasma\"\n\t\"installdir\"\t\t\"Fantasma\"\n}\n";
 
     const ACF_REDIST: &str = "\"AppState\"\n{\n\t\"appid\"\t\t\"228980\"\n\t\"name\"\t\t\"Steamworks Common Redistributables\"\n\t\"installdir\"\t\t\"Steamworks Shared\"\n}\n";
+
+    #[test]
+    fn scans_lua_files_by_app_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lua_dir = tmp.path().join("config").join("lua");
+
+        fs::create_dir_all(&lua_dir).unwrap();
+
+        fs::write(lua_dir.join("201830.lua"), "").unwrap();
+        fs::write(lua_dir.join("220.lua"), "").unwrap();
+        fs::write(lua_dir.join("999.LUA"), "").unwrap();
+
+        // Estos nombres deben ignorarse.
+        fs::write(lua_dir.join("invalid.lua"), "").unwrap();
+        fs::write(lua_dir.join("123abc.lua"), "").unwrap();
+        fs::write(lua_dir.join("0.lua"), "").unwrap();
+        fs::write(lua_dir.join("readme.txt"), "").unwrap();
+
+        let result = scan_lua_app_ids(tmp.path()).unwrap();
+
+        assert_eq!(
+            result,
+            vec![220, 999, 201830].into_iter().collect::<Vec<_>>()
+        );
+    }
 
     #[test]
     fn reads_new_library_folders_format() {
@@ -384,7 +501,8 @@ mod tests {
 
     #[test]
     fn manifest_with_path_traversal_is_rejected() {
-        let acf = "\"AppState\" { \"appid\" \"1\" \"name\" \"X\" \"installdir\" \"../../Windows\" }";
+        let acf =
+            "\"AppState\" { \"appid\" \"1\" \"name\" \"X\" \"installdir\" \"../../Windows\" }";
         assert!(parse_manifest(acf, "appmanifest_1.acf").is_err());
     }
 
@@ -433,6 +551,17 @@ mod tests {
     }
 
     #[test]
+fn finds_lua_games_not_installed() {
+    let lua_app_ids: Vec<u64> = vec![10, 20, 30, 40];
+    let installed_app_ids: Vec<u64> = vec![10, 30];
+
+    let result =
+        find_uninstalled_lua_app_ids(&lua_app_ids, &installed_app_ids);
+
+    assert_eq!(result, vec![20, 40]);
+}
+
+    #[test]
     fn finds_the_app_id_of_a_game_by_its_path() {
         let tmp = tempfile::tempdir().unwrap();
         let apps = tmp.path().join("Biblioteca").join("SteamApps");
@@ -440,12 +569,21 @@ mod tests {
         fs::create_dir_all(game.join("bin")).unwrap();
         fs::write(apps.join("appmanifest_220.acf"), ACF_HL2).unwrap();
 
-        assert_eq!(app_id_for_path(&game.join("bin").join("hl2.exe")), Some(220));
+        assert_eq!(
+            app_id_for_path(&game.join("bin").join("hl2.exe")),
+            Some(220)
+        );
         assert_eq!(app_id_for_path(&game), Some(220));
         // Fuera de steamapps\common no se asume nada.
-        assert_eq!(app_id_for_path(&tmp.path().join("Otros").join("x.exe")), None);
+        assert_eq!(
+            app_id_for_path(&tmp.path().join("Otros").join("x.exe")),
+            None
+        );
         // Carpeta sin manifiesto.
-        assert_eq!(app_id_for_path(&apps.join("common").join("Desconocido").join("a.exe")), None);
+        assert_eq!(
+            app_id_for_path(&apps.join("common").join("Desconocido").join("a.exe")),
+            None
+        );
     }
 
     #[test]

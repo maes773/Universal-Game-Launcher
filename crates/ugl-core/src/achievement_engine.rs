@@ -119,7 +119,12 @@ pub fn store(
                  unlocked = MAX(unlocks.unlocked, excluded.unlocked),
                  unlocked_at = COALESCE(excluded.unlocked_at, unlocks.unlocked_at),
                  updated_at = excluded.updated_at",
-            params![achievement_id, record.unlocked as i64, record.unlocked_at, now],
+            params![
+                achievement_id,
+                record.unlocked as i64,
+                record.unlocked_at,
+                now
+            ],
         )?;
     }
     tx.commit()?;
@@ -241,9 +246,23 @@ mod tests {
     #[test]
     fn stale_reads_never_relock_an_achievement() {
         let (mut db, id) = setup();
-        store(db.conn_mut(), id, "steam_local", Provenance::Imported, &[record("A", true, Some(50))]).unwrap();
+        store(
+            db.conn_mut(),
+            id,
+            "steam_local",
+            Provenance::Imported,
+            &[record("A", true, Some(50))],
+        )
+        .unwrap();
         // Una lectura posterior con la caché atrasada dice «bloqueado» y sin fecha.
-        store(db.conn_mut(), id, "steam_local", Provenance::Imported, &[record("A", false, None)]).unwrap();
+        store(
+            db.conn_mut(),
+            id,
+            "steam_local",
+            Provenance::Imported,
+            &[record("A", false, None)],
+        )
+        .unwrap();
 
         let list = list(db.conn(), id).unwrap();
         assert_eq!(list.len(), 1);
@@ -254,7 +273,14 @@ mod tests {
     #[test]
     fn removing_a_game_removes_its_achievements() {
         let (mut db, id) = setup();
-        store(db.conn_mut(), id, "steam_local", Provenance::Imported, &[record("A", true, None)]).unwrap();
+        store(
+            db.conn_mut(),
+            id,
+            "steam_local",
+            Provenance::Imported,
+            &[record("A", true, None)],
+        )
+        .unwrap();
         registry::remove_game(db.conn(), id).unwrap();
         let count: i64 = db
             .conn()

@@ -1,3 +1,4 @@
+
 //! Tipos del dominio. Sin acceso a disco ni a base de datos.
 
 use std::path::{Path, PathBuf};
@@ -79,7 +80,7 @@ impl SortOrder {
         }
     }
 
-    /// Posición en el desplegable de la interfaz.
+    /// Posición en el desplegable.
     pub fn index(self) -> i32 {
         match self {
             SortOrder::Title => 0,
@@ -97,7 +98,25 @@ impl SortOrder {
     }
 }
 
-/// Un juego de la biblioteca junto con su instalación principal.
+/// Una instalación real de un juego.
+///
+/// Un juego puede tener ninguna, una o varias instalaciones.
+#[derive(Debug, Clone)]
+pub struct Installation {
+    pub install_path: PathBuf,
+    pub launch_kind: LaunchKind,
+    pub launch_target: String,
+    /// Ejecutable directo conocido (relativo a `install_path` o absoluto),
+    /// aunque el juego se inicie por Steam.
+    pub exe_path: Option<String>,
+    pub launch_args: String,
+    /// Directorio de trabajo; `None` = carpeta del ejecutable.
+    pub working_dir: Option<String>,
+    /// AppID de Steam asociado a esta instalación, si corresponde.
+    pub steam_app_id: Option<u64>,
+}
+
+/// Un juego de la biblioteca, independientemente de que esté instalado.
 #[derive(Debug, Clone)]
 pub struct Game {
     pub id: GameId,
@@ -105,27 +124,23 @@ pub struct Game {
     pub platform: String,
     /// Proveedor que lo registró: "manual", "steam"…
     pub source: String,
-    pub install_path: PathBuf,
-    pub launch_kind: LaunchKind,
-    pub launch_target: String,
+    /// Instalación principal. `None` significa que el juego no está instalado.
+    pub installation: Option<Installation>,
     pub added_at: i64,
     pub last_played_at: Option<i64>,
     pub achievements_total: u32,
     pub achievements_unlocked: u32,
     /// None = sin intentar; Some("") = sin icono; Some(ruta) = PNG en la caché.
     pub icon_path: Option<String>,
-    /// Ejecutable directo conocido (relativo a `install_path` o absoluto), aunque el juego se
-    /// inicie por Steam.
-    pub exe_path: Option<String>,
-    pub launch_args: String,
-    /// Directorio de trabajo; `None` = carpeta del ejecutable.
-    pub working_dir: Option<String>,
-    /// AppID de Steam conocido, aunque el juego se inicie con su ejecutable.
+    /// AppID de Steam conocido, aunque el juego no esté instalado o se inicie
+    /// mediante su propio ejecutable.
     pub steam_app_id: Option<u64>,
 }
 
 /// Lo que una integración entrega al registro. Es el único contrato entre
 /// los proveedores (manual, Steam, futuros) y el núcleo.
+///
+/// Este tipo representa siempre un juego que ya tiene una instalación real.
 #[derive(Debug, Clone, Default)]
 pub struct DiscoveredGame {
     pub provider: String,
@@ -142,7 +157,8 @@ pub struct DiscoveredGame {
     pub steam_app_id: Option<u64>,
 }
 
-/// Cambios pedidos al método de lanzamiento de un juego (los valida `Core::update_launch`).
+/// Cambios pedidos al método de lanzamiento de un juego
+/// (los valida `Core::update_launch`).
 #[derive(Debug, Clone, Default)]
 pub struct LaunchSettings {
     pub kind: LaunchKind,
@@ -191,8 +207,13 @@ pub struct RegisterSummary {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameStatus {
+    /// Tiene una instalación registrada y está listo para iniciarse.
     Ready,
+    /// Está en la biblioteca, pero todavía no tiene ninguna instalación.
+    NotInstalled,
+    /// La carpeta de una instalación registrada no se encuentra.
     MissingFolder,
+    /// La carpeta existe, pero falta el ejecutable configurado.
     MissingExecutable,
 }
 
@@ -200,6 +221,7 @@ impl GameStatus {
     pub fn message(self) -> &'static str {
         match self {
             GameStatus::Ready => "Listo para jugar",
+            GameStatus::NotInstalled => "No instalado",
             GameStatus::MissingFolder => {
                 "No se encuentra la carpeta del juego (¿se movió o está en un disco desconectado?)"
             }
@@ -234,7 +256,8 @@ pub fn format_date(unix: i64) -> String {
     format!("{day:02}/{month:02}/{year}")
 }
 
-/// Clave normalizada de una ruta para detectar duplicados (Windows no distingue mayúsculas).
+/// Clave normalizada de una ruta para detectar duplicados
+/// (Windows no distingue mayúsculas).
 pub fn path_key(path: &Path) -> String {
     path.to_string_lossy()
         .to_lowercase()
@@ -271,7 +294,11 @@ mod tests {
 
     #[test]
     fn launch_kind_roundtrip() {
-        for kind in [LaunchKind::Executable, LaunchKind::SteamUri, LaunchKind::Uri] {
+        for kind in [
+            LaunchKind::Executable,
+            LaunchKind::SteamUri,
+            LaunchKind::Uri,
+        ] {
             assert_eq!(LaunchKind::parse(kind.as_str()), Some(kind));
             assert_eq!(LaunchKind::from_index(kind.index()), kind);
         }
@@ -288,5 +315,10 @@ mod tests {
             assert_eq!(SortOrder::parse(order.as_str()), Some(order));
             assert_eq!(SortOrder::from_index(order.index()), order);
         }
+    }
+
+    #[test]
+    fn game_status_distinguishes_uninstalled_games() {
+        assert_eq!(GameStatus::NotInstalled.message(), "No instalado");
     }
 }

@@ -149,7 +149,11 @@ pub fn fetch_library(key: &str) -> Result<Vec<ItchGame>> {
 }
 
 fn cover_extension(url: &str) -> &'static str {
-    let path = url.split(['?', '#']).next().unwrap_or("").to_ascii_lowercase();
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
     if path.ends_with(".jpg") || path.ends_with(".jpeg") {
         "jpg"
     } else if path.ends_with(".gif") {
@@ -207,24 +211,37 @@ mod tests {
         assert_eq!(games[0].title, "Volcanic & Sinkhole");
         assert_eq!(games[0].author, "Gurken Labs");
         assert_eq!(games[0].description, "Un mapa de batalla.");
-        assert!(games[0].cover_url.as_deref().unwrap().starts_with("https://img.itch.zone/"));
+        assert!(games[0]
+            .cover_url
+            .as_deref()
+            .unwrap()
+            .starts_with("https://img.itch.zone/"));
         assert_eq!(games[1].author, "yuser");
         assert_eq!(games[1].cover_url, None);
     }
 
     #[test]
     fn the_end_of_the_library_is_an_empty_page_in_either_shape() {
-        assert!(parse_owned_keys(r#"{"page":9,"owned_keys":[]}"#).unwrap().is_empty());
+        assert!(parse_owned_keys(r#"{"page":9,"owned_keys":[]}"#)
+            .unwrap()
+            .is_empty());
         // El servidor escribe una lista vacía como objeto.
-        assert!(parse_owned_keys(r#"{"page":9,"owned_keys":{}}"#).unwrap().is_empty());
+        assert!(parse_owned_keys(r#"{"page":9,"owned_keys":{}}"#)
+            .unwrap()
+            .is_empty());
         assert!(parse_owned_keys(r#"{}"#).unwrap().is_empty());
     }
 
     #[test]
     fn api_errors_are_reported_even_with_http_200() {
-        let err = parse_owned_keys(r#"{"errors":["invalid key"]}"#).unwrap_err().to_string();
+        let err = parse_owned_keys(r#"{"errors":["invalid key"]}"#)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("no es válida"));
-        assert!(parse_owned_keys(r#"{"errors":["rate limited"]}"#).unwrap_err().to_string().contains("rate limited"));
+        assert!(parse_owned_keys(r#"{"errors":["rate limited"]}"#)
+            .unwrap_err()
+            .to_string()
+            .contains("rate limited"));
         assert!(parse_owned_keys("<html>").is_err());
     }
 
@@ -234,7 +251,10 @@ mod tests {
             parse_profile(r#"{"user":{"id":1,"username":"ana","display_name":"Ana G"}}"#).unwrap(),
             Some("Ana G".to_string())
         );
-        assert_eq!(parse_profile(r#"{"user":{"username":"ana"}}"#).unwrap(), Some("ana".to_string()));
+        assert_eq!(
+            parse_profile(r#"{"user":{"username":"ana"}}"#).unwrap(),
+            Some("ana".to_string())
+        );
         assert_eq!(parse_profile(r#"{}"#).unwrap(), None);
     }
 
@@ -242,7 +262,9 @@ mod tests {
     fn api_keys_have_a_sane_shape() {
         assert!(is_valid_api_key("AbCdEfGhIjKlMnOpQrStUvWxYz0123456789abcd"));
         assert!(!is_valid_api_key("corta"));
-        assert!(!is_valid_api_key("una clave con espacios y comillas \" no vale"));
+        assert!(!is_valid_api_key(
+            "una clave con espacios y comillas \" no vale"
+        ));
     }
 
     #[test]
